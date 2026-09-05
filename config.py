@@ -10,7 +10,7 @@ from pathlib import Path
 # ============================================================
 # MT4 数据文件夹路径 (在MT4中 File → Open Data Folder 获取)
 # 例如: C:\Users\hlin2\AppData\Roaming\MetaQuotes\Terminal\XXXXXXXX
-METATRADER_DIR_PATH = r"C:\Users\hlin2\AppData\Roaming\MetaQuotes\Terminal\35EEC3EFDB656AF6FC775F21FEAD053B"
+METATRADER_DIR_PATH = r"C:\Users\kilimy\AppData\Roaming\MetaQuotes\Terminal\AB75DD8A03E8CC693E1336EB0D50BA2D"
 
 # MT4 文件桥接目录 (EA和Python通过这个目录通信)
 BRIDGE_DIR = Path(METATRADER_DIR_PATH) / "MQL4" / "Files" / "DWX"
@@ -18,22 +18,22 @@ BRIDGE_DIR = Path(METATRADER_DIR_PATH) / "MQL4" / "Files" / "DWX"
 # ============================================================
 # 交易账户参数
 # ============================================================
-SYMBOL = "XAUUSD.mx"      # EMX Pro Limited 的黄金品种名称
-CAPITAL = 2000            # 本金 (USD)
-MAX_TOTAL_LOSS = 1500     # 最大总亏损 (USD)，达到后停止交易
-LOT_SIZE = 0.03           # 手数 (0.03手 = 3盎司)
+SYMBOL = "XAUUSD"      # EMX Pro Limited 的黄金品种名称
+CAPITAL = 1000            # 本金 (USD)
+MAX_TOTAL_LOSS = 70     # 最大总亏损 (USD)，达到后停止交易
+LOT_SIZE = 0.02           # 手数 (0.03手 = 3盎司)
 # 每点价值: 0.03手 × $100/点/标准手 = $3/点 (价格每变动$1 = 盈亏$3)
 POINT_VALUE_PER_LOT = 100  # 标准手每点价值 ($100/点)
-MAX_POSITIONS = 2         # 最大同时持仓数
-STOP_LOSS_PIPS = 20       # 默认止损距离 ($20 = 0.03手亏$60)
+MAX_POSITIONS = 3         # 最大同时持仓数
+STOP_LOSS_PIPS = 10       # 默认止损距离 ($20 = 0.03手亏$60)
 MAGIC_NUMBER = 20260325   # EA魔术号 (区分手动单和策略单)
 SLIPPAGE = 5              # 最大滑点 (点)
-DAILY_MAX_LOSS = 9999     # 单日最大亏损金额 (已改用笔数控制，此项保留作极端保护)
-DAILY_MAX_LOSSES = 3      # 单日最大亏损笔数 (达到后停止交易，回测Sharpe 0.84→2.84)
-COOLDOWN_BARS = 3         # 止损后冷却期 (3根H1 K线 = 3小时)
+DAILY_MAX_LOSS = 50     # 单日最大亏损金额 (已改用笔数控制，此项保留作极端保护)
+DAILY_MAX_LOSSES = 5      # 单日最大亏损笔数 (达到后停止交易，回测Sharpe 0.84→2.84)
+COOLDOWN_BARS = 0.5        # 止损后冷却期 (3根H1 K线 = 3小时)
 
 # ── ATR自动调仓 ──
-RISK_PER_TRADE = 50       # 每笔交易最大风险金额 (2.5%×$2000=$50)
+RISK_PER_TRADE = 25       # 每笔交易最大风险金额 (2.5%×$2000=$50)
 AUTO_LOT_SIZING = True    # 是否启用ATR自动调仓 (True=根据ATR调整手数, False=固定LOT_SIZE)
 MIN_LOT_SIZE = 0.01       # 最小手数
 MAX_LOT_SIZE = 0.03       # 最大手数 (本金$2000, 保守控制)
@@ -58,7 +58,7 @@ STRATEGIES = {
         "max_hold_bars": 15,
     },
     "macd": {
-        "enabled": False,  # v5禁用: 11年Sharpe=-0.36, 71%信号与Keltner重叠, 拉低组合Sharpe
+        "enabled": True,  # v5禁用: 11年Sharpe=-0.36, 71%信号与Keltner重叠, 拉低组合Sharpe
         "name": "MACD+EMA100趋势",
         "stop_loss": 20,
         "take_profit": 50,
@@ -81,8 +81,8 @@ SIGNAL_CHECK_TIMEFRAME = "MULTI"  # 多时间框架: H1 + M15
 # 通知
 # ============================================================
 NOTIFY_METHOD = "telegram"     # "console" | "telegram"
-TELEGRAM_BOT_TOKEN = "8646871612:AAFzMhC_4-rh7_f2E47ankyh45IxFczmVw8"
-TELEGRAM_CHAT_ID = "8531960227"
+TELEGRAM_BOT_TOKEN = "8819242532:AAFqK5iaFDfqffgTGHopsZMIM-rBbOAwQkw"
+TELEGRAM_CHAT_ID = "2093450740"
 
 # ============================================================
 # 路径

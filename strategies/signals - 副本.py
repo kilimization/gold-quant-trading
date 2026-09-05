@@ -466,189 +466,45 @@ def check_exit_signal(df: pd.DataFrame, strategy: str, direction: str) -> Option
             elif direction == 'SELL' and macd_hist > 0 and macd_hist_prev <= 0:
                 return "MACD空头出场: 柱状图转正"
 
-    elif strategy in ("m5_rsi", "m15_rsi"):
-        rsi2 = float(latest["RSI2"])
-        close = float(latest["Close"])
-        sma20 = float(latest["SMA20"]) if "SMA20" in latest else None
+    elif strategy in ('m5_rsi', 'm15_rsi'):
+        rsi2 = float(latest['RSI2'])
+        if not pd.isna(rsi2):
+            if direction == 'BUY' and rsi2 > 55:
+                return f"M15 RSI多头出场: RSI(2)={rsi2:.1f} > 55"
+            elif direction == 'SELL' and rsi2 < 45:
+                return f"M15 RSI空头出场: RSI(2)={rsi2:.1f} < 45"
 
-    if not pd.isna(rsi2):
-        # 【做多出场条件】：
-        # 条件1: RSI(2) 真正冲高到极限超买区 (> 75/80)
-        # 条件2 (可选): 价格成功回归并突破 SMA20 均线
-        if direction == "BUY":
-            if rsi2 > 75:  # 调高阈值到 75
-                return f"M15 RSI多头离场: RSI(2)={rsi2:.1f} > 75 (动能饱和平仓)"
-            elif sma20 and close > sma20 and rsi2 > 50:
-                return f"M15 RSI多头离场: 价格已回归至 SMA20 上方 (${close:.2f})"
-        # 【做空出场条件】：
-        elif direction == "SELL":
-            if rsi2 < 25:  # 调低阈值到 25
-                return f"M15 RSI空头离场: RSI(2)={rsi2:.1f} < 25 (超卖探底平仓)"
-        elif sma20 and close < sma20 and rsi2 < 50:
-            return f"M15 RSI空头离场: 价格已回归至 SMA20 下方 (${close:.2f})"
     return None
 
 
-from typing import Dict, Optional
-import pandas as pd
+def check_m15_rsi_signal(df: pd.DataFrame) -> Optional[Dict]:
+    """M15 RSI均值回归信号 (不需要ADX/状态机，震荡市有效)"""
+    if len(df) < 55:
+        return None
+    latest = df.iloc[-1]
+    close = float(latest['Close'])
+    rsi2 = float(latest['RSI2'])
+    sma50 = float(latest['SMA50'])
+    if pd.isna(rsi2) or pd.isna(sma50):
+        return None
 
+    sl = _calc_atr_stop(df) if not pd.isna(df.iloc[-1]['ATR']) else 15
+    sl = min(sl, 20)
 
-def check_m15_rsi_signal(
-    df: pd.DataFrame, df_m5: Optional[pd.DataFrame] = None
-) -> Optional[Dict]:
-  """M15 RSI均值回归信号 (严谨时态与数据对齐终极版)
-
-  核心逻辑:
-  1. 数据排序: 自动纠正 EA 传来的 M5 数据顺序，确保按时间升序排列
-  2. 震荡确认: M15 ADX < 25 (排除强单边趋势)
-  3. 极值预警: 前一根 或 当前实时 M15 RSI(2) < 25 (做多超卖) 或 > 85 (做空超买)
-  4. 严格止跌: 最新完全收盘的 M5 实体长度必须大于上下影线之和，且占总长的一半以上
-  """
-  if df is None or len(df) < 55:
+    if rsi2 < 15 and close > sma50:
+        return {
+            'strategy': 'm15_rsi', 'signal': 'BUY',
+            'reason': f"M15 RSI做多: RSI(2)={rsi2:.1f} < 15, 超卖反弹",
+            'close': close, 'sl': sl, 'tp': 0,
+        }
+    if rsi2 > 85 and close < sma50:
+        return {
+            'strategy': 'm15_rsi', 'signal': 'SELL',
+            'reason': f"M15 RSI做空: RSI(2)={rsi2:.1f} > 85, 超买回落",
+            'close': close, 'sl': sl, 'tp': 0,
+        }
     return None
 
-  # 确保 df (M15) 按时间升序排列
-  time_col = "t" if "t" in df.columns else ("Time" if "Time" in df.columns else None)
-  if time_col:
-    df[time_col] = pd.to_datetime(df[time_col])
-    df = df.sort_values(time_col, ascending=True).reset_index(drop=True)
-
-  latest = df.iloc[-1]
-  prev = df.iloc[-2]  # 提取前一根 M15 K 线
-
-  close = float(latest["Close"])
-
-  # 提取前一根与当前实时 RSI2
-  prev_rsi2 = float(prev["RSI2"]) if "RSI2" in prev else None
-  curr_rsi2 = float(latest["RSI2"]) if "RSI2" in latest else None
-
-  # 1. 基础指标存在性校验
-  if (
-      prev_rsi2 is None
-      or pd.isna(prev_rsi2)
-      or curr_rsi2 is None
-      or pd.isna(curr_rsi2)
-  ):
-    return None
-
-  # 2. M15 ADX < 25 震荡硬过滤
-  adx14 = (
-      float(latest["ADX14"])
-      if "ADX14" in latest and not pd.isna(latest["ADX14"])
-      else (
-          float(latest["ADX"])
-          if "ADX" in latest and not pd.isna(latest["ADX"])
-          else None
-      )
-  )
-
-  if adx14 is not None and adx14 >= 25:
-    return None
-
-  # 3. M5 严格止跌/见顶形态确认 (含数据排序与时间戳核对)
-  is_m5_bullish = None  # 未传 df_m5 时不放行
-  is_m5_bearish = None
-
-  if df_m5 is not None and len(df_m5) >= 2:
-    # 强制将 M5 数据按时间升序排列 (保证 iloc[-1] 是最新实时, iloc[-2] 是上一根已收盘)
-    m5_time_col = (
-        "t"
-        if "t" in df_m5.columns
-        else ("Time" if "Time" in df_m5.columns else None)
-    )
-    if m5_time_col:
-      df_m5[m5_time_col] = pd.to_datetime(df_m5[m5_time_col])
-      df_m5 = df_m5.sort_values(m5_time_col, ascending=True).reset_index(
-          drop=True
-      )
-
-    # 取最新一根【完全收盘】的 M5 K线
-    last_closed_m5 = df_m5.iloc[-2]
-
-    m5_time = (
-        last_closed_m5[m5_time_col] if m5_time_col else "未提供时间戳"
-    )
-    m5_open = float(last_closed_m5["Open"])
-    m5_high = float(last_closed_m5["High"])
-    m5_low = float(last_closed_m5["Low"])
-    m5_close = float(last_closed_m5["Close"])
-
-    # K线属性计算
-    m5_body = abs(m5_close - m5_open)  # 实体大小
-    m5_total = m5_high - m5_low  # K线总长度 (High - Low)
-    m5_shadows = m5_total - m5_body  # 上下影线总长度
-
-    # 实体判定标准：
-    # 1. K线总波动不能为 0（避免平盘/一字线）
-    # 2. 实体大于上下影线总和 (m5_body > m5_shadows)
-    # 3. 实体占总长的一半以上 (m5_body >= 0.5 * m5_total)
-    has_strong_body = (
-        m5_total > 0 and m5_body > m5_shadows and m5_body >= 0.5 * m5_total
-    )
-
-    is_m5_bullish = (m5_close > m5_open) and has_strong_body
-    is_m5_bearish = (m5_close < m5_open) and has_strong_body
-
-    # 排查调试输出：协助在控制台直接核对 MT4 对应时间与 K线形态数据
-    print(
-        f"[M5校验] 对应时间: {m5_time} | Open: {m5_open:.2f} | Close:"
-        f" {m5_close:.2f} | High: {m5_high:.2f} | Low: {m5_low:.2f} | 实体:"
-        f" {m5_body:.2f} | 总长: {m5_total:.2f} | 阳线止跌: {is_m5_bullish} |"
-        f" 阴线见顶: {is_m5_bearish}"
-    )
-
-  elif df_m5 is not None and len(df_m5) < 2:
-    return None  # 数据量不足，安全退出
-
-  # 4. 安全计算动态止损
-  atr_val = latest.get("ATR", float("nan"))
-  if not pd.isna(atr_val) and "_calc_atr_stop" in globals():
-    sl = _calc_atr_stop(df)
-  else:
-    sl = float(atr_val * 1) if not pd.isna(atr_val) else 8.0
-  sl = min(max(sl, 6.0), 12.0)  # 止损限制在 6 ~ 12 美元之间
-
-  # 5. 做多条件：RSI2 触及 < 25 + 最新收盘 M5 必须为强实体阳线
-  is_rsi_oversold = (prev_rsi2 < 25) or (curr_rsi2 < 25)
-  if is_rsi_oversold and is_m5_bullish:
-    return {
-        "strategy": "m15_rsi",
-        "signal": "BUY",
-        "reason": (
-            f"M15 RSI做多: RSI(2)极值(前1={prev_rsi2:.1f},"
-            f" 实时={curr_rsi2:.1f} < 25), 最新M5为大实体阳线 (ADX={adx14:.1f} < 25)"
-            if adx14
-            else (
-                f"M15 RSI做多: RSI(2)极值(前1={prev_rsi2:.1f},"
-                f" 实时={curr_rsi2:.1f} < 25), 最新M5为大实体阳线"
-            )
-        ),
-        "close": close,
-        "sl": sl,
-        "tp": 0,
-    }
-
-  # 6. 做空条件：RSI2 触及 > 85 + 最新收盘 M5 必须为强实体阴线
-  is_rsi_overbought = (prev_rsi2 > 85) or (curr_rsi2 > 85)
-  if is_rsi_overbought and is_m5_bearish:
-    return {
-        "strategy": "m15_rsi",
-        "signal": "SELL",
-        "reason": (
-            f"M15 RSI做空: RSI(2)极值(前1={prev_rsi2:.1f},"
-            f" 实时={curr_rsi2:.1f} > 85), 最新M5为大实体阴线 (ADX={adx14:.1f} < 25)"
-            if adx14
-            else (
-                f"M15 RSI做空: RSI(2)极值(前1={prev_rsi2:.1f},"
-                f" 实时={curr_rsi2:.1f} > 85), 最新M5为大实体阴线"
-            )
-        ),
-        "close": close,
-        "sl": sl,
-        "tp": 0,
-    }
-
-  return None
 
 # ═══════════════════════════════════════════════════════════════
 # NY开盘区间突破 (ORB) 策略
@@ -857,7 +713,7 @@ def calc_auto_lot_size(atr: float, sl_distance: float) -> float:
 # 信号扫描入口
 # ═══════════════════════════════════════════════════════════════
 
-def scan_all_signals(df: pd.DataFrame, timeframe: str = 'H1', df_m5: Optional[pd.DataFrame] = None) -> List[Dict]:
+def scan_all_signals(df: pd.DataFrame, timeframe: str = 'H1') -> List[Dict]:
     """扫描所有已启用策略的信号"""
     import config as _scan_cfg
     signals = []
@@ -875,8 +731,7 @@ def scan_all_signals(df: pd.DataFrame, timeframe: str = 'H1', df_m5: Optional[pd
             if sig:
                 signals.append(sig)
     elif timeframe in ('M5', 'M15'):
-        # 修正：将 df_m5 正确传递给 check_m15_rsi_signal
-        sig = check_m15_rsi_signal(df, df_m5=df_m5)
+        sig = check_m15_rsi_signal(df)
         if sig:
             signals.append(sig)
     return signals

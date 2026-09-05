@@ -1,18 +1,6 @@
-"""
-黄金量化交易主引擎
-==================
-管理持仓、执行交易、风控保护
-
-职责:
-1. 从MT4获取行情数据
-2. 运行信号引擎检测入场/出场
-3. 通过MT4桥接执行交易
-4. 风险管理 (总亏损保护、仓位控制)
-5. 记录交易日志
-"""
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -21,8 +9,10 @@ import yfinance as yf
 
 import config
 from mt4_bridge import MT4Bridge
-from strategies.signals import (prepare_indicators, scan_all_signals, check_exit_signal,
-                                get_orb_strategy, calc_auto_lot_size)
+from strategies.signals import (
+    prepare_indicators, scan_all_signals, check_exit_signal,
+    get_orb_strategy, calc_auto_lot_size
+)
 import notifier
 
 # 舆情分析模块 (安全导入，失败不影响交易)
@@ -51,9 +41,13 @@ class GoldTrader:
         self.tracking_file = config.DATA_DIR / "gold_position_tracking.json"
         self.log_file = config.DATA_DIR / "gold_trade_log.json"
         self.pnl_file = config.DATA_DIR / "gold_total_pnl.json"
+        
         self.tracking = self._load_json(self.tracking_file, {})
         self.trade_log = self._load_json(self.log_file, [])
         self.total_pnl = self._load_json(self.pnl_file, {"total_pnl": 0, "trade_count": 0})
+        
+        # 暂停标志位 (False 表示正常允许交易)
+        self.is_paused = False
         
         # 错失信号记录
         self.missed_signals_file = config.DATA_DIR / "gold_missed_signals.json"
@@ -61,7 +55,11 @@ class GoldTrader:
         
         # 冷却期跟踪: {strategy: 上次亏损时间}
         self.cooldown_until = {}
-        # 日内亏损跟踪 (从文件恢复，防止重启丢失)
+        
+        # 日内状态跟踪
+        self.daily_pnl = 0.0
+        self.daily_loss_count = 0
+        self.daily_date = datetime.now().date()
         self.daily_state_file = config.DATA_DIR / "gold_daily_state.json"
         self._load_daily_state()
         
@@ -76,17 +74,20 @@ class GoldTrader:
         else:
             log.info("舆情模块未安装，纯技术面交易")
 
-    def _load_json(self, path, default):
+    # ── JSON 辅助函数 ──
+
+    def _load_json(self, path: Path, default):
         if path.exists():
-            with open(path) as f:
+            with open(path, 'r', encoding='utf-8') as f:
                 try:
                     return json.load(f)
-                except:
+                except Exception as e:
+                    log.error(f"读取 JSON 失败 [{path}]: {e}")
                     return default
         return default
 
-    def _save_json(self, path, data):
-        with open(path, 'w') as f:
+    def _save_json(self, path: Path, data):
+        with open(path, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, default=str)
 
     def _save_tracking(self):
@@ -94,6 +95,9 @@ class GoldTrader:
 
     def _save_trade_log(self):
         self._save_json(self.log_file, self.trade_log)
+
+    def _save_pnl(self):
+        self._save_json(self.pnl_file, self.total_pnl)
 
     def _log_missed_signal(self, sig: Dict, filter_reason: str):
         """记录被过滤的信号，用于复盘分析机会成本"""
@@ -108,13 +112,9 @@ class GoldTrader:
             'filter_reason': filter_reason,
         }
         self.missed_signals.append(record)
-        # 只保留最近500条
         if len(self.missed_signals) > 500:
             self.missed_signals = self.missed_signals[-500:]
         self._save_json(self.missed_signals_file, self.missed_signals)
-
-    def _save_pnl(self):
-        self._save_json(self.pnl_file, self.total_pnl)
 
     # ── 数据获取 ──
 
@@ -124,7 +124,7 @@ class GoldTrader:
         try:
             if not filepath.exists():
                 return None
-            with open(filepath, 'r') as f:
+            with open(filepath, 'r', encoding='utf-8') as f:
                 data = json.loads(f.read())
             
             bars = data.get('bars', [])
@@ -139,7 +139,6 @@ class GoldTrader:
                 })
             
             df = pd.DataFrame(rows)
-            # 解析时间戳作为索引
             times = [pd.Timestamp(b['t'].replace('.', '-')) for b in bars]
             df.index = pd.DatetimeIndex(times)
             df.index.name = 'Datetime'
@@ -181,33 +180,114 @@ class GoldTrader:
         log.debug("M15数据来源: yfinance (fallback)")
         return self._get_yfinance_data('15m', '30d')
 
-    # ── 风控检查 ──
+    # ── 风控与状态检查 ──
 
     def check_total_loss_limit(self) -> bool:
         """检查是否超过总亏损上限"""
         total = self.total_pnl.get('total_pnl', 0)
-        if total <= -config.MAX_TOTAL_LOSS:
-            log.warning(f"🛑 总亏损已达 ${total:.2f}，超过上限 ${config.MAX_TOTAL_LOSS}，停止交易")
+        max_loss = getattr(config, 'MAX_TOTAL_LOSS', 1000)
+        if total <= -max_loss:
+            log.warning(f"🛑 总亏损已达 ${total:.2f}，超过上限 ${max_loss}，停止交易")
             return True
         return False
 
     def get_strategy_positions(self) -> List[Dict]:
         """获取本策略的持仓 (通过magic number过滤)"""
         all_pos = self.bridge.get_positions()
-        return [p for p in all_pos if p.get('magic') == config.MAGIC_NUMBER]
+        magic = getattr(config, 'MAGIC_NUMBER', 888888)
+        return [p for p in all_pos if p.get('magic') == magic]
+
+    def _load_daily_state(self):
+        """从文件加载日内状态，防止重启丢失"""
+        state = self._load_json(self.daily_state_file, {})
+        saved_date = state.get('date', '')
+        today = str(datetime.now().date())
+        
+        if saved_date == today:
+            self.daily_pnl = state.get('pnl', 0.0)
+            self.daily_loss_count = state.get('loss_count', 0)
+            self.daily_date = datetime.now().date()
+            max_losses = getattr(config, 'DAILY_MAX_LOSSES', 3)
+            log.info(f"  📊 恢复日内状态: PnL=${self.daily_pnl:.2f}, 亏损{self.daily_loss_count}/{max_losses}笔")
+        else:
+            self.daily_pnl = 0.0
+            self.daily_loss_count = 0
+            self.daily_date = datetime.now().date()
+
+    def _save_daily_state(self):
+        """保存日内状态到文件"""
+        state = {
+            'date': str(self.daily_date),
+            'pnl': self.daily_pnl,
+            'loss_count': self.daily_loss_count,
+        }
+        self._save_json(self.daily_state_file, state)
+
+    def _update_daily_pnl(self, profit: float):
+        """更新日内盈亏跟踪"""
+        today = datetime.now().date()
+        if today != self.daily_date:
+            self.daily_pnl = 0.0
+            self.daily_loss_count = 0
+            self.daily_date = today
+        self.daily_pnl = round(self.daily_pnl + profit, 2)
+        if profit < 0:
+            self.daily_loss_count += 1
+            max_losses = getattr(config, 'DAILY_MAX_LOSSES', 3)
+            log.info(f"     📊 日内亏损第{self.daily_loss_count}笔 (上限{max_losses}笔)")
+        self._save_daily_state()
+
+    def _check_daily_loss_limit(self) -> bool:
+        """检查是否超过日内最大亏损笔数或金额"""
+        today = datetime.now().date()
+        if today != self.daily_date:
+            self.daily_pnl = 0.0
+            self.daily_loss_count = 0
+            self.daily_date = today
+            self._save_daily_state()
+            
+        max_losses = getattr(config, 'DAILY_MAX_LOSSES', 3)
+        max_daily_loss = getattr(config, 'DAILY_MAX_LOSS', 300)
+        
+        if self.daily_loss_count >= max_losses or self.daily_pnl <= -max_daily_loss:
+            return True
+        return False
+
+    def _is_in_cooldown(self, strategy: str) -> bool:
+        """检查策略是否在冷却期"""
+        if strategy in self.cooldown_until:
+            if datetime.now() < self.cooldown_until[strategy]:
+                return True
+            else:
+                del self.cooldown_until[strategy]
+        return False
+
+    def _get_sentiment_context(self) -> Optional[Dict]:
+        """获取舆情分析结果"""
+        if not self.sentiment:
+            return None
+        try:
+            return self.sentiment.get_trading_context()
+        except Exception as e:
+            log.warning(f"舆情分析异常 (不影响交易): {e}")
+            return None
+
+    def _get_current_direction(self) -> Optional[str]:
+        """获取当前持仓方向 (BUY/SELL/None)"""
+        positions = self.get_strategy_positions()
+        if not positions:
+            return None
+        pos_type = positions[0].get('type', 0)
+        return 'SELL' if pos_type == 1 else 'BUY'
 
     # ── 核心交易逻辑 ──
 
     def _sync_positions_tracking(self):
-        """同步MT4持仓与tracking记录
-        1. 更新现有持仓的实时盈亏
-        2. 已平仓单(止损/手动)自动检测并记录盈亏
-        3. 新开仓单自动补录tracking
-        """
+        """同步MT4持仓与tracking记录"""
         mt4_positions = self.get_strategy_positions()
         mt4_tickets = {str(p['ticket']): p for p in mt4_positions}
         
-        # 1. 更新现有持仓的实时盈亏 (存入tracking，平仓时用)
+        # 1. 更新现有持仓的实时盈亏
         for pos in mt4_positions:
             tk = str(pos['ticket'])
             if tk in self.tracking:
@@ -224,16 +304,15 @@ class GoldTrader:
                 direction = track.get('direction', 'BUY')
                 entry_price = track.get('entry_price', 0)
                 last_profit = track.get('last_profit', 0)
-                lots = track.get('lots', config.LOT_SIZE)
+                default_lot = getattr(config, 'LOT_SIZE', 0.01)
+                lots = track.get('lots', default_lot)
                 
                 log.info(f"  ⚠️ 检测到 #{ticket_key} ({strategy}) 已被MT4平仓")
                 log.info(f"     估算盈亏: ${last_profit:+.2f} (开仓价: {entry_price})")
                 notifier.notify_close(int(ticket_key), strategy, last_profit, 'MT4自动平仓(止损或手动)')
                 
                 # 更新总盈亏
-                self.total_pnl['total_pnl'] = round(
-                    self.total_pnl.get('total_pnl', 0) + last_profit, 2
-                )
+                self.total_pnl['total_pnl'] = round(self.total_pnl.get('total_pnl', 0) + last_profit, 2)
                 self.total_pnl['trade_count'] = self.total_pnl.get('trade_count', 0) + 1
                 self._save_pnl()
                 
@@ -242,8 +321,7 @@ class GoldTrader:
                 
                 # 亏损时设置冷却期
                 if last_profit < 0:
-                    from datetime import timedelta
-                    cooldown_hours = config.COOLDOWN_BARS  # 3小时
+                    cooldown_hours = getattr(config, 'COOLDOWN_BARS', 3)
                     self.cooldown_until[strategy] = datetime.now() + timedelta(hours=cooldown_hours)
                     log.info(f"     ❄️ {strategy} 进入冷却期，{cooldown_hours}小时后才可开仓")
                 
@@ -262,11 +340,10 @@ class GoldTrader:
                 del self.tracking[ticket_key]
                 self._save_tracking()
         
-        # 2. 检测未tracking的新仓位 (开仓后ticket未同步)
+        # 3. 检测未 tracking 的新仓位
         for pos in mt4_positions:
             ticket_key = str(pos['ticket'])
             if ticket_key not in self.tracking:
-                # 从comment推断策略 (comment格式: GOLD_kelt / GOLD_orb / GOLD_m15_)
                 comment = pos.get('comment', '')
                 strategy = 'unknown'
                 cl = comment.lower()
@@ -297,6 +374,10 @@ class GoldTrader:
 
     def scan_and_trade(self) -> Dict:
         """完整扫描+交易流程"""
+        if self.is_paused:
+            log.info("系统处于暂停状态，已忽略扫描与交易指令。")
+            return {"status": "paused", "reason": "user_paused"}
+
         now = datetime.now()
         log.info(f"\n{'='*60}")
         log.info(f"📊 黄金量化交易 — {now.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -310,9 +391,10 @@ class GoldTrader:
             return {"status": "stopped", "reason": "total_loss_limit"}
 
         # 日内亏损检查
+        max_losses = getattr(config, 'DAILY_MAX_LOSSES', 3)
         if self._check_daily_loss_limit():
             log.warning(f"\n{'!'*60}")
-            log.warning(f"🚨 日内亏损{self.daily_loss_count}笔 (上限{config.DAILY_MAX_LOSSES}笔) | 日内PnL: ${self.daily_pnl:.2f}")
+            log.warning(f"🚨 日内亏损{self.daily_loss_count}笔 (上限{max_losses}笔) | 日内PnL: ${self.daily_pnl:.2f}")
             log.warning(f"🛑 系统停止交易，明日自动恢复")
             log.warning(f"{'!'*60}")
             notifier.notify_stop_review(self.daily_pnl)
@@ -322,8 +404,8 @@ class GoldTrader:
         sentiment_ctx = self._get_sentiment_context()
 
         # 经济日历暂停检查
-        if sentiment_ctx and not sentiment_ctx['trade_modifier']['allow_trading']:
-            pause_reason = sentiment_ctx['calendar'].get('pause_reason', '未知原因')
+        if sentiment_ctx and not sentiment_ctx.get('trade_modifier', {}).get('allow_trading', True):
+            pause_reason = sentiment_ctx.get('calendar', {}).get('pause_reason', '未知原因')
             log.info(f"  🛑 舆情避险: {pause_reason}，暂停交易")
             log.info(f"{'='*60}")
             return {"status": "paused", "reason": pause_reason}
@@ -338,23 +420,23 @@ class GoldTrader:
         if df_h1 is not None:
             latest = df_h1.iloc[-1]
             close = float(latest['Close'])
-            rsi14 = float(latest['RSI14']) if not pd.isna(latest['RSI14']) else 50
-            macd_h = float(latest['MACD_hist']) if not pd.isna(latest['MACD_hist']) else 0
+            rsi14 = float(latest['RSI14']) if not pd.isna(latest.get('RSI14')) else 50
+            macd_h = float(latest['MACD_hist']) if not pd.isna(latest.get('MACD_hist')) else 0
             log.info(f"  XAU/USD H1: ${close:.2f}  RSI(14): {rsi14:.1f}  MACD: {macd_h:+.2f}")
         
         if df_m15 is not None:
             m15_latest = df_m15.iloc[-1]
-            m15_rsi = float(m15_latest['RSI2']) if not pd.isna(m15_latest['RSI2']) else 50
+            m15_rsi = float(m15_latest['RSI2']) if not pd.isna(m15_latest.get('RSI2')) else 50
             log.info(f"  XAU/USD M15: RSI(2): {m15_rsi:.1f}")
 
-        # Step 1: 检查现有持仓出场 (H1和M5都检查)
+        # Step 1: 检查现有持仓出场
         exits = []
         if df_h1 is not None:
             exits += self._check_exits(df_h1)
         if df_m15 is not None:
             exits += self._check_exits(df_m15)
 
-        # Step 2: 检查新入场信号 (H1 + M5)
+        # Step 2: 检查新入场信号
         entries = []
         if df_h1 is not None:
             entries += self._check_entries(df_h1, 'H1', sentiment_ctx)
@@ -367,10 +449,12 @@ class GoldTrader:
             log.info(f"⚡ 执行了 {total} 笔操作")
         else:
             log.info(f"✅ 无操作")
-        log.info(f"  总盈亏: ${self.total_pnl.get('total_pnl', 0):.2f} / 上限: -${config.MAX_TOTAL_LOSS}")
-        log.info(f"  日内盈亏: ${self.daily_pnl:.2f} | 亏损{self.daily_loss_count}/{config.DAILY_MAX_LOSSES}笔")
         
-        # 打印ADX和舆情
+        max_total_loss = getattr(config, 'MAX_TOTAL_LOSS', 1000)
+        log.info(f"  总盈亏: ${self.total_pnl.get('total_pnl', 0):.2f} / 上限: -${max_total_loss}")
+        log.info(f"  日内盈亏: ${self.daily_pnl:.2f} | 亏损{self.daily_loss_count}/{max_losses}笔")
+        
+        # 打印状态指标
         if df_h1 is not None:
             adx_val = float(df_h1.iloc[-1]['ADX']) if not pd.isna(df_h1.iloc[-1].get('ADX', float('nan'))) else 0
             atr_val = float(df_h1.iloc[-1]['ATR']) if not pd.isna(df_h1.iloc[-1].get('ATR', float('nan'))) else 0
@@ -380,15 +464,17 @@ class GoldTrader:
             log.info(f"  🇺🇸 ORB: {orb.get_status()}")
         
         if sentiment_ctx:
-            s = sentiment_ctx['sentiment']
-            m = sentiment_ctx['trade_modifier']
+            s = sentiment_ctx.get('sentiment', {})
+            m = sentiment_ctx.get('trade_modifier', {})
             label_cn = {'BULLISH': '看涨', 'BEARISH': '看跌', 'NEUTRAL': '中性'}
-            log.info(f"  🌐 舆情: {label_cn.get(s['label'], s['label'])}({s['score']:.2f}) "
-                     f"方向偏好: {m['direction_bias'] or '无'} 仓位系数: {m['lot_multiplier']:.1f}")
+            s_label = s.get('label', 'NEUTRAL')
+            s_score = s.get('score', 0.0)
+            log.info(f"  🌐 舆情: {label_cn.get(s_label, s_label)}({s_score:.2f}) "
+                     f"方向偏好: {m.get('direction_bias') or '无'} 仓位系数: {m.get('lot_multiplier', 1.0):.1f}")
         
         # 打印冷却期状态
         if self.cooldown_until:
-            for strat, until in self.cooldown_until.items():
+            for strat, until in list(self.cooldown_until.items()):
                 remaining = (until - datetime.now()).total_seconds() / 60
                 if remaining > 0:
                     log.info(f"  ❄️ {strat} 冷却中 (还剩{remaining:.0f}分钟)")
@@ -405,26 +491,22 @@ class GoldTrader:
 
         now = datetime.now()
         exits = []
-
         log.info(f"\n  📋 持仓监控 ({len(positions)} 笔):")
 
         for pos in positions:
             ticket = pos.get('ticket', 0)
-            symbol = pos.get('symbol', '')
             lots = pos.get('lots', 0)
             open_price = pos.get('open_price', 0)
             current_price = pos.get('current_price', 0)
             profit = pos.get('profit', 0)
-            comment = pos.get('comment', '')
 
-            # 从tracking获取策略信息
             track_key = str(ticket)
             track = self.tracking.get(track_key, {})
             strategy = track.get('strategy', 'unknown')
             entry_date_str = track.get('entry_date', now.isoformat())
             try:
                 entry_date = datetime.fromisoformat(entry_date_str)
-            except:
+            except Exception:
                 entry_date = now
             hold_days = (now - entry_date).days
 
@@ -433,7 +515,6 @@ class GoldTrader:
             log.info(f"    {emoji} #{ticket} {strategy}: {lots}手 @ {open_price:.2f} "
                      f"→ {current_price:.2f} ({pnl_pct:+.2f}%) ${profit:+.2f} {hold_days}天")
 
-            # 出场判断
             reason = None
             direction = track.get('direction', 'BUY')
 
@@ -443,7 +524,8 @@ class GoldTrader:
                 reason = exit_sig
 
             # 2. 时间止损
-            max_hold = config.STRATEGIES.get(strategy, {}).get('max_hold_bars', 15)
+            strat_configs = getattr(config, 'STRATEGIES', {})
+            max_hold = strat_configs.get(strategy, {}).get('max_hold_bars', 15)
             if not reason and hold_days >= max_hold:
                 reason = f"⏰ 时间止损: {hold_days}天 >= {max_hold}天"
 
@@ -463,11 +545,8 @@ class GoldTrader:
                 self.trade_log.append(trade)
                 self._save_trade_log()
 
-                # 更新总盈亏
                 if success:
-                    self.total_pnl['total_pnl'] = round(
-                        self.total_pnl.get('total_pnl', 0) + profit, 2
-                    )
+                    self.total_pnl['total_pnl'] = round(self.total_pnl.get('total_pnl', 0) + profit, 2)
                     self.total_pnl['trade_count'] = self.total_pnl.get('trade_count', 0) + 1
                     self._save_pnl()
 
@@ -479,126 +558,33 @@ class GoldTrader:
 
         return exits
 
-    def _load_daily_state(self):
-        """从文件加载日内状态，防止重启丢失"""
-        state = self._load_json(self.daily_state_file, {})
-        saved_date = state.get('date', '')
-        today = str(datetime.now().date())
-        
-        if saved_date == today:
-            # 同一天，恢复状态
-            self.daily_pnl = state.get('pnl', 0.0)
-            self.daily_loss_count = state.get('loss_count', 0)
-            self.daily_date = datetime.now().date()
-            log.info(f"  📊 恢复日内状态: PnL=${self.daily_pnl:.2f}, 亏损{self.daily_loss_count}/{config.DAILY_MAX_LOSSES}笔")
-        else:
-            # 新的一天，重置
-            self.daily_pnl = 0.0
-            self.daily_loss_count = 0
-            self.daily_date = datetime.now().date()
-
-    def _save_daily_state(self):
-        """保存日内状态到文件"""
-        state = {
-            'date': str(self.daily_date),
-            'pnl': self.daily_pnl,
-            'loss_count': self.daily_loss_count,
-        }
-        self._save_json(self.daily_state_file, state)
-
-    def _update_daily_pnl(self, profit: float):
-        """更新日内盈亏跟踪"""
-        today = datetime.now().date()
-        if today != self.daily_date:
-            self.daily_pnl = 0.0
-            self.daily_loss_count = 0
-            self.daily_date = today
-        self.daily_pnl = round(self.daily_pnl + profit, 2)
-        if profit < 0:
-            self.daily_loss_count += 1
-            log.info(f"     📊 日内亏损第{self.daily_loss_count}笔 (上限{config.DAILY_MAX_LOSSES}笔)")
-        self._save_daily_state()
-
-    def _check_daily_loss_limit(self) -> bool:
-        """检查是否超过日内最大亏损笔数"""
-        today = datetime.now().date()
-        if today != self.daily_date:
-            self.daily_pnl = 0.0
-            self.daily_loss_count = 0
-            self.daily_date = today
-            self._save_daily_state()
-        # 笔数限制 (主要控制)
-        if self.daily_loss_count >= config.DAILY_MAX_LOSSES:
-            return True
-        # 金额限制 (极端保护)
-        if self.daily_pnl <= -config.DAILY_MAX_LOSS:
-            return True
-        return False
-
-    def _is_in_cooldown(self, strategy: str) -> bool:
-        """检查策略是否在冷却期"""
-        if strategy in self.cooldown_until:
-            if datetime.now() < self.cooldown_until[strategy]:
-                remaining = (self.cooldown_until[strategy] - datetime.now()).total_seconds() / 60
-                return True
-            else:
-                del self.cooldown_until[strategy]  # 冷却期已过
-        return False
-
-    def _get_sentiment_context(self) -> Optional[Dict]:
-        """获取舆情分析结果 (失败返回None，不影响交易)"""
-        if not self.sentiment:
-            return None
-        try:
-            ctx = self.sentiment.get_trading_context()
-            return ctx
-        except Exception as e:
-            log.warning(f"舆情分析异常 (不影响交易): {e}")
-            return None
-
-    def _get_current_direction(self) -> Optional[str]:
-        """获取当前持仓方向 (BUY/SELL/None)"""
-        positions = self.get_strategy_positions()
-        if not positions:
-            return None
-        # 以第一笔持仓的方向为准 (0=BUY, 1=SELL)
-        pos_type = positions[0].get('type', 0)
-        return 'SELL' if pos_type == 1 else 'BUY'
-
     def _check_entries(self, df: pd.DataFrame, timeframe: str = 'H1',
-                        sentiment_ctx: Optional[Dict] = None) -> List[Dict]:
+                       sentiment_ctx: Optional[Dict] = None) -> List[Dict]:
         """检查新入场信号"""
-        # 持仓数检查
+        max_positions = getattr(config, 'MAX_POSITIONS', 2)
         current_positions = self.get_strategy_positions()
-        if len(current_positions) >= config.MAX_POSITIONS:
-            # 仍然扫描信号，记录错失的机会
+        
+        if len(current_positions) >= max_positions:
             _missed_signals = scan_all_signals(df, timeframe)
             for _ms in _missed_signals:
-                self._log_missed_signal(_ms, f"持仓已满({len(current_positions)}/{config.MAX_POSITIONS})")
+                self._log_missed_signal(_ms, f"持仓已满({len(current_positions)}/{max_positions})")
             if _missed_signals:
-                log.info(f"\n  📊 已持有 {len(current_positions)}/{config.MAX_POSITIONS} 笔，不再开仓 (错失{len(_missed_signals)}个信号)")
+                log.info(f"\n  📊 已持有 {len(current_positions)}/{max_positions} 笔，不再开仓 (错失{len(_missed_signals)}个信号)")
             else:
-                log.info(f"\n  📊 已持有 {len(current_positions)}/{config.MAX_POSITIONS} 笔，不再开仓")
+                log.info(f"\n  📊 已持有 {len(current_positions)}/{max_positions} 笔，不再开仓")
             return []
 
-        # 获取当前持仓方向，防止开反向仓
         current_dir = self._get_current_direction()
-        
-        # 舆情参数 (方向过滤已关闭，仅保留经济日历暂停 + 日志显示)
-        # 原因: 舆情准确率未验证，如果<55%只会增加噪音
-        sentiment_bias = None   # 已关闭: 不再用舆情过滤方向
-        lot_multiplier = 1.0    # 已关闭: 不再用舆情调整仓位
+        lot_multiplier = 1.0
 
-        slots = config.MAX_POSITIONS - len(current_positions)
+        slots = max_positions - len(current_positions)
         log.info(f"\n  🔍 信号扫描 (可开 {slots} 笔):")
 
-        # 扫描对应时间框架的策略信号
         signals = scan_all_signals(df, timeframe)
 
         if not signals:
-            # 打印接近触发的信号
             latest = df.iloc[-1]
-            rsi2 = float(latest['RSI2']) if not pd.isna(latest['RSI2']) else 100
+            rsi2 = float(latest['RSI2']) if not pd.isna(latest.get('RSI2')) else 100
             if rsi2 < 20:
                 log.info(f"    👀 RSI(2)={rsi2:.1f} 接近触发 (阈值<5)")
             else:
@@ -606,59 +592,50 @@ class GoldTrader:
             return []
 
         entries = []
+        default_stop_loss = getattr(config, 'STOP_LOSS_PIPS', 20.0)
+        min_lot = getattr(config, 'MIN_LOT_SIZE', 0.01)
+        max_lot = getattr(config, 'MAX_LOT_SIZE', 1.0)
+        lot_size_cfg = getattr(config, 'LOT_SIZE', 0.01)
+        point_val = getattr(config, 'POINT_VALUE_PER_LOT', 100)
+
         for sig in signals[:slots]:
             strategy = sig['strategy']
             reason = sig['reason']
             close = sig['close']
 
-            # 冷却期检查: 止损后等待冷却期结束
             if self._is_in_cooldown(strategy):
                 remaining = (self.cooldown_until[strategy] - datetime.now()).total_seconds() / 60
                 log.info(f"    ❄️ {reason} — 但{strategy}在冷却期中 (还剩{remaining:.0f}分钟)")
                 self._log_missed_signal(sig, f"冷却期(还剩{remaining:.0f}分钟)")
                 continue
 
-            # 同策略重复持仓检测: 同一策略已有持仓时不再开新仓
-            active_strategies = set()
-            for tk, track in self.tracking.items():
-                active_strategies.add(track.get('strategy', ''))
+            active_strategies = {track.get('strategy', '') for track in self.tracking.values()}
             if strategy in active_strategies:
                 log.info(f"    🚫 {reason} — 但{strategy}已有持仓，不重复开仓")
                 self._log_missed_signal(sig, f"同策略已持仓({strategy})")
                 continue
 
-            # 方向冲突检测: 已有持仓时不开反向仓
-            direction = sig['signal']  # 'BUY' 或 'SELL'
+            direction = sig['signal']
             if current_dir and direction != current_dir:
                 log.info(f"    ⛔ {reason} — 但当前持仓方向为{current_dir}，跳过反向{direction}信号")
                 self._log_missed_signal(sig, f"方向冲突(持仓{current_dir}, 信号{direction})")
                 continue
 
-            # 舆情方向过滤: 已关闭 (等待准确率验证)
-            # if sentiment_bias and direction != sentiment_bias:
-            #     log.info(f"    🌐 {reason} — 但舆情偏好{sentiment_bias}，跳过反向{direction}信号")
-            #     continue
-
             log.info(f"    🚀 {reason}")
 
-            # 止损/止盈距离 (优先用信号自带的ATR止损止盈)
-            sl_pips = sig.get('sl', config.STOP_LOSS_PIPS)
+            sl_pips = sig.get('sl', default_stop_loss)
             tp_pips = sig.get('tp', 0)
             
-            # M15 RSI策略tp=0(用RSI信号出场)，但MT4仍需要硬止盈保护
-            # 设置安全止盈 = 2×止损距离 (RR 1:2)
             if tp_pips <= 0:
                 tp_pips = sl_pips * 2
                 log.info(f"    🛡️ 安全止盈: ${tp_pips:.1f} (2×止损, MT4硬保护)")
             
-            # ATR自动调仓: 根据止损距离计算手数，保持每笔风险$100
             base_lots = calc_auto_lot_size(0, sl_pips)
             actual_lots = round(base_lots * lot_multiplier, 2)
-            actual_lots = max(config.MIN_LOT_SIZE, min(config.MAX_LOT_SIZE, actual_lots))
-            if actual_lots != config.LOT_SIZE:
-                log.info(f"    📊 自动调仓: 止损${sl_pips:.1f} → {actual_lots}手 (风险${sl_pips*actual_lots*config.POINT_VALUE_PER_LOT:.0f})")
-            if lot_multiplier != 1.0:
-                log.info(f"    🌐 舆情仓位调整: ×{lot_multiplier:.1f}")
+            actual_lots = max(min_lot, min(max_lot, actual_lots))
+            
+            if actual_lots != lot_size_cfg:
+                log.info(f"    📊 自动调仓: 止损${sl_pips:.1f} → {actual_lots}手 (风险${sl_pips * actual_lots * point_val:.0f})")
             
             if direction == 'BUY':
                 success = self.bridge.buy(
@@ -696,10 +673,8 @@ class GoldTrader:
         return entries
 
     def check_exits_only(self) -> Dict:
-        """仅检查出场 (盘中监控, H1+M5双时间框架)"""
-        # 先同步持仓状态，检测止损/手动平仓
+        """仅检查出场 (盘中监控)"""
         self._sync_positions_tracking()
-        
         exits = []
         df_h1 = self.get_hourly_data()
         if df_h1 is not None:
@@ -708,3 +683,23 @@ class GoldTrader:
         if df_m15 is not None:
             exits += self._check_exits(df_m15)
         return {"exits": exits}
+
+    # ── 外部控制接口 ──
+
+    def pause_trading(self):
+        """暂停交易"""
+        self.is_paused = True
+        log.info("⏸️ 系统交易状态已更新：已【暂停】交易")
+
+    def resume_trading(self):
+        """恢复交易"""
+        self.is_paused = False
+        log.info("▶️ 系统交易状态已更新：已【恢复】交易")
+
+    def check_and_execute(self):
+        """交易信号检测与下单统一入口"""
+        if self.is_paused:
+            log.info("系统处于暂停交易状态，已跳过执行。")
+            return {"status": "paused"}
+            
+        return self.scan_and_trade()
