@@ -7,6 +7,8 @@ Telegram 交互与通知模块
 
 import asyncio
 import logging
+import httpx
+import httpcore
 import threading
 from typing import Callable, Optional
 
@@ -14,11 +16,15 @@ from telegram import Update
 from telegram.ext import Application,ApplicationBuilder,CommandHandler, ContextTypes
 from telegram.ext import ApplicationBuilder
 from telegram.request import HTTPXRequest
+from telegram.error import NetworkError, TelegramError
 
 import config
+import logging
 
 log = logging.getLogger(__name__)
-
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext._utils.networkloop").setLevel(logging.CRITICAL)
 # 全局存储应用实例与系统状态提供者/控制句柄
 _tg_app: Optional[Application] = None
 _status_provider: Optional[Callable[[], dict]] = None
@@ -227,7 +233,7 @@ def init_telegram_bot(
   """
 # 1. 从 config 获取 Token
   token = getattr(config, "TELEGRAM_BOT_TOKEN", None)
-  proxy_url = getattr(config, "TELEGRAM_PROXY", "http://127.0.0.1:7890")  # 替换为你的代理端口
+  proxy_url = getattr(config, "TELEGRAM_PROXY", "http://127.0.0.1:7899")  # 替换为你的代理端口
 
   builder = ApplicationBuilder().token(token)
 
@@ -252,16 +258,31 @@ def init_telegram_bot(
   _status_provider = status_provider_func
   _control_handler = control_handler_func
 
-  def _run_bot():
+def _run_bot():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     global _tg_app
+
+    # 1. 配置代理与超时 (优先读取 config 中的代理，默9 端口)
+    proxy_url = getattr(config, "TELEGRAM_PROXY", "http://127.0.0.1:7899")
+    request_kwargs = {"connect_timeout": 15.0, "read_timeout": 15.0}
+    
+    if proxy_url:
+        request_kwargs["proxy"] = proxy_url
+
+    request = HTTPXRequest(**request_kwargs)
+
+    # 2. 构建 Application 并绑定 request
     _tg_app = (
-        Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
+        Application.builder()
+        .token(config.TELEGRAM_BOT_TOKEN)
+        .request(request)
+        .get_updates_request(request)
+        .build()
     )
 
-    # 注册指令路由
+    # 3. 注册指令路由
     _tg_app.add_handler(CommandHandler("start", _cmd_start))
     _tg_app.add_handler(CommandHandler("help", _cmd_start))
     _tg_app.add_handler(CommandHandler("status", _cmd_status))
@@ -269,12 +290,25 @@ def init_telegram_bot(
     _tg_app.add_handler(CommandHandler("pause", _cmd_pause))
     _tg_app.add_handler(CommandHandler("resume", _cmd_resume))
 
-    log.info("Telegram 交互与控制服务启动成功...")
-    _tg_app.run_polling(drop_pending_updates=True, stop_signals=None)
+    # 4. 捕获连接异常，避免刷屏
+    try:
+        log.info("Telegram 交互与控制服务启动中...")
+        _tg_app.run_polling(
+            drop_pending_updates=True, 
+            stop_signals=None,
+            bootstrap_retries=3  # 尝试连接3次
+        )
+    except (NetworkError, httpx.ConnectError, httpcore.ConnectError) as e:
+        log.error(f"❌ Telegram Bot 连接失败: 无法连接 API，请检查代理配置 (代理: {proxy_url}) | 错误: {e}")
+    except TelegramError as e:
+        log.error(f"❌ Telegram API 异常: {e}")
+    except Exception as e:
+        log.error(f"❌ Telegram 服务发生未预期错误: {e}")
 
-  t = threading.Thread(target=_run_bot, daemon=True, name="TelegramBotThread")
-  t.start()
 
+# 后台线程启动
+t = threading.Thread(target=_run_bot, daemon=True, name="TelegramBotThread")
+t.start()
 
 # ═══════════════════════════════════════════════════════════════
 # 3. 原有被动推送函数

@@ -493,18 +493,24 @@ from typing import Dict, Optional
 import pandas as pd
 
 
+import logging
+from typing import Dict, Optional
+import pandas as pd
+
+log = logging.getLogger(__name__)
+
+
 def check_m15_rsi_signal(
     df: pd.DataFrame, df_m5: Optional[pd.DataFrame] = None
 ) -> Optional[Dict]:
-  """M15 RSI均值回归信号 (严谨时态与数据对齐终极版)
+  """M15 RSI均值回归信号 (含全过程日志排查版)"""
 
-  核心逻辑:
-  1. 数据排序: 自动纠正 EA 传来的 M5 数据顺序，确保按时间升序排列
-  2. 震荡确认: M15 ADX < 25 (排除强单边趋势)
-  3. 极值预警: 前一根 或 当前实时 M15 RSI(2) < 25 (做多超卖) 或 > 85 (做空超买)
-  4. 严格止跌: 最新完全收盘的 M5 实体长度必须大于上下影线之和，且占总长的一半以上
-  """
-  if df is None or len(df) < 55:
+  # --- 校验 0: 数据长度 ---
+  if df is None:
+    print("[M15-RSI] ❌ 失败: M15 数据源为空 (df is None)")
+    return None
+  if len(df) < 55:
+    print(f"[M15-RSI] ❌ 失败: M15 数据行数不足 (当前: {len(df)} 行, 需要 >= 55)")
     return None
 
   # 确保 df (M15) 按时间升序排列
@@ -522,16 +528,20 @@ def check_m15_rsi_signal(
   prev_rsi2 = float(prev["RSI2"]) if "RSI2" in prev else None
   curr_rsi2 = float(latest["RSI2"]) if "RSI2" in latest else None
 
-  # 1. 基础指标存在性校验
+  # --- 校验 1: RSI2 数据完整性 ---
   if (
       prev_rsi2 is None
       or pd.isna(prev_rsi2)
       or curr_rsi2 is None
       or pd.isna(curr_rsi2)
   ):
+    print(
+        f"[M15-RSI] ❌ 失败: RSI2 数据缺失 (前1: {prev_rsi2}, 实时:"
+        f" {curr_rsi2})"
+    )
     return None
 
-  # 2. M15 ADX < 25 震荡硬过滤
+  # --- 校验 2: ADX 震荡硬过滤 ---
   adx14 = (
       float(latest["ADX14"])
       if "ADX14" in latest and not pd.isna(latest["ADX14"])
@@ -543,14 +553,17 @@ def check_m15_rsi_signal(
   )
 
   if adx14 is not None and adx14 >= 25:
+    print(
+        f"[M15-RSI] ❌ 过滤: M15 处于趋势行情 (ADX={adx14:.1f} >= 25,"
+        " 排除震荡策略)"
+    )
     return None
 
-  # 3. M5 严格止跌/见顶形态确认 (含数据排序与时间戳核对)
-  is_m5_bullish = None  # 未传 df_m5 时不放行
+  # --- 校验 3: M5 形态确认 ---
+  is_m5_bullish = None
   is_m5_bearish = None
 
   if df_m5 is not None and len(df_m5) >= 2:
-    # 强制将 M5 数据按时间升序排列 (保证 iloc[-1] 是最新实时, iloc[-2] 是上一根已收盘)
     m5_time_col = (
         "t"
         if "t" in df_m5.columns
@@ -562,9 +575,7 @@ def check_m15_rsi_signal(
           drop=True
       )
 
-    # 取最新一根【完全收盘】的 M5 K线
     last_closed_m5 = df_m5.iloc[-2]
-
     m5_time = (
         last_closed_m5[m5_time_col] if m5_time_col else "未提供时间戳"
     )
@@ -573,80 +584,101 @@ def check_m15_rsi_signal(
     m5_low = float(last_closed_m5["Low"])
     m5_close = float(last_closed_m5["Close"])
 
-    # K线属性计算
-    m5_body = abs(m5_close - m5_open)  # 实体大小
-    m5_total = m5_high - m5_low  # K线总长度 (High - Low)
-    m5_shadows = m5_total - m5_body  # 上下影线总长度
+    m5_body = abs(m5_close - m5_open)
+    m5_total = m5_high - m5_low
 
-    # 实体判定标准：
-    # 1. K线总波动不能为 0（避免平盘/一字线）
-    # 2. 实体大于上下影线总和 (m5_body > m5_shadows)
-    # 3. 实体占总长的一半以上 (m5_body >= 0.5 * m5_total)
-    has_strong_body = (
-        m5_total > 0 and m5_body > m5_shadows and m5_body >= 0.5 * m5_total
-    )
-
+    has_strong_body = m5_total > 0 and m5_body >= 0.2 * m5_total
     is_m5_bullish = (m5_close > m5_open) and has_strong_body
     is_m5_bearish = (m5_close < m5_open) and has_strong_body
 
-    # 排查调试输出：协助在控制台直接核对 MT4 对应时间与 K线形态数据
     print(
-        f"[M5校验] 对应时间: {m5_time} | Open: {m5_open:.2f} | Close:"
-        f" {m5_close:.2f} | High: {m5_high:.2f} | Low: {m5_low:.2f} | 实体:"
-        f" {m5_body:.2f} | 总长: {m5_total:.2f} | 阳线止跌: {is_m5_bullish} |"
-        f" 阴线见顶: {is_m5_bearish}"
+        f"[M5校验] 时间: {m5_time} | Open: {m5_open:.2f} | Close:"
+        f" {m5_close:.2f} | 实体: {m5_body:.2f}/{m5_total:.2f} | 强阳止跌:"
+        f" {is_m5_bullish} | 强阴见顶: {is_m5_bearish}"
     )
 
-  elif df_m5 is not None and len(df_m5) < 2:
-    return None  # 数据量不足，安全退出
+  elif df_m5 is None:
+    print("[M15-RSI] ⚠️ 警告: 未传入 M5 数据 (df_m5 is None)，无法校验止跌/见顶")
+  elif len(df_m5) < 2:
+    print(
+        f"[M15-RSI] ❌ 失败: M5 数据量不足 (当前: {len(df_m5)} 行, 需要 >= 2)"
+    )
+    return None
 
-  # 4. 安全计算动态止损
-  atr_val = latest.get("ATR", float("nan"))
-  if not pd.isna(atr_val) and "_calc_atr_stop" in globals():
-    sl = _calc_atr_stop(df)
-  else:
-    sl = float(atr_val * 1) if not pd.isna(atr_val) else 8.0
-  sl = min(max(sl, 6.0), 12.0)  # 止损限制在 6 ~ 12 美元之间
-
-  # 5. 做多条件：RSI2 触及 < 25 + 最新收盘 M5 必须为强实体阳线
-  is_rsi_oversold = (prev_rsi2 < 25) or (curr_rsi2 < 25)
-  if is_rsi_oversold and is_m5_bullish:
-    return {
-        "strategy": "m15_rsi",
-        "signal": "BUY",
-        "reason": (
-            f"M15 RSI做多: RSI(2)极值(前1={prev_rsi2:.1f},"
-            f" 实时={curr_rsi2:.1f} < 25), 最新M5为大实体阳线 (ADX={adx14:.1f} < 25)"
-            if adx14
-            else (
-                f"M15 RSI做多: RSI(2)极值(前1={prev_rsi2:.1f},"
-                f" 实时={curr_rsi2:.1f} < 25), 最新M5为大实体阳线"
-            )
-        ),
-        "close": close,
-        "sl": sl,
-        "tp": 0,
-    }
-
-  # 6. 做空条件：RSI2 触及 > 85 + 最新收盘 M5 必须为强实体阴线
+  # --- 校验 4: 触发条件判断 ---
+  is_rsi_oversold = (prev_rsi2 < 15) or (curr_rsi2 < 15)
   is_rsi_overbought = (prev_rsi2 > 85) or (curr_rsi2 > 85)
-  if is_rsi_overbought and is_m5_bearish:
-    return {
-        "strategy": "m15_rsi",
-        "signal": "SELL",
-        "reason": (
-            f"M15 RSI做空: RSI(2)极值(前1={prev_rsi2:.1f},"
-            f" 实时={curr_rsi2:.1f} > 85), 最新M5为大实体阴线 (ADX={adx14:.1f} < 25)"
-            if adx14
-            else (
-                f"M15 RSI做空: RSI(2)极值(前1={prev_rsi2:.1f},"
-                f" 实时={curr_rsi2:.1f} > 85), 最新M5为大实体阴线"
-            )
-        ),
-        "close": close,
-        "sl": sl,
-        "tp": 0,
-    }
+
+  # 4.1 做多判断
+  if is_rsi_oversold:
+    if is_m5_bullish:
+      atr_val = latest.get("ATR", float("nan"))
+      sl = (
+          _calc_atr_stop(df)
+          if not pd.isna(atr_val) and "_calc_atr_stop" in globals()
+          else (float(atr_val * 1) if not pd.isna(atr_val) else 8.0)
+      )
+      sl = min(max(sl, 6.0), 12.0)
+
+      print(
+          f"🚀 [M15-RSI] ✅ 触发做多信号! RSI2(前1={prev_rsi2:.1f},"
+          f" 实时={curr_rsi2:.1f}), M5强阳"
+      )
+      return {
+          "strategy": "m15_rsi",
+          "signal": "BUY",
+          "reason": (
+              f"M15 RSI做多: RSI(2)(前1={prev_rsi2:.1f}, 实时={curr_rsi2:.1f}"
+              f" < 15), M5强阳止跌 (ADX={adx14:.1f})"
+          ),
+          "close": close,
+          "sl": sl,
+          "tp": 0,
+      }
+    else:
+      print(
+          f"[M15-RSI] ⏳ 未触发做多: M15 RSI2 已超卖 (前1={prev_rsi2:.1f},"
+          f" 实时={curr_rsi2:.1f} < 15)，但 M5 未出现强实体阳线止跌"
+      )
+
+  # 4.2 做空判断
+  elif is_rsi_overbought:
+    if is_m5_bearish:
+      atr_val = latest.get("ATR", float("nan"))
+      sl = (
+          _calc_atr_stop(df)
+          if not pd.isna(atr_val) and "_calc_atr_stop" in globals()
+          else (float(atr_val * 1) if not pd.isna(atr_val) else 8.0)
+      )
+      sl = min(max(sl, 6.0), 12.0)
+
+      print(
+          f"🚀 [M15-RSI] ✅ 触发做空信号! RSI2(前1={prev_rsi2:.1f},"
+          f" 实时={curr_rsi2:.1f}), M5强阴"
+      )
+      return {
+          "strategy": "m15_rsi",
+          "signal": "SELL",
+          "reason": (
+              f"M15 RSI做空: RSI(2)(前1={prev_rsi2:.1f}, 实时={curr_rsi2:.1f}"
+              f" > 85), M5强阴见顶 (ADX={adx14:.1f})"
+          ),
+          "close": close,
+          "sl": sl,
+          "tp": 0,
+      }
+    else:
+      print(
+          f"[M15-RSI] ⏳ 未触发做空: M15 RSI2 已超买 (前1={prev_rsi2:.1f},"
+          f" 实时={curr_rsi2:.1f} > 85)，但 M5 未出现强实体阴线见顶"
+      )
+
+  else:
+    # 既不超买也不超卖时的常规汇报
+    print(
+        f"[M15-RSI] ⚪ 无信号: RSI2(前1={prev_rsi2:.1f},"
+        f" 实时={curr_rsi2:.1f}) 处于常态区间 [15 ~ 85]"
+    )
 
   return None
 
@@ -857,10 +889,17 @@ def calc_auto_lot_size(atr: float, sl_distance: float) -> float:
 # 信号扫描入口
 # ═══════════════════════════════════════════════════════════════
 
-def scan_all_signals(df: pd.DataFrame, timeframe: str = 'H1', df_m5: Optional[pd.DataFrame] = None) -> List[Dict]:
+def scan_all_signals(
+    df: pd.DataFrame, 
+    timeframe: str = 'H1', 
+    df_m5: Optional[pd.DataFrame] = None,
+    df_m15: Optional[pd.DataFrame] = None
+) -> List[Dict]:
     """扫描所有已启用策略的信号"""
     import config as _scan_cfg
     signals = []
+
+    # 1. H1 级别策略扫描
     if timeframe == 'H1':
         sig = check_keltner_signal(df)
         if sig:
@@ -869,14 +908,27 @@ def scan_all_signals(df: pd.DataFrame, timeframe: str = 'H1', df_m5: Optional[pd
             sig = check_macd_signal(df)
             if sig:
                 signals.append(sig)
-        # ORB策略 (也用H1数据)
+        # ORB策略
         if _scan_cfg.ORB_ENABLED:
             sig = check_orb_signal(df)
             if sig:
                 signals.append(sig)
-    elif timeframe in ('M5', 'M15'):
-        # 修正：将 df_m5 正确传递给 check_m15_rsi_signal
-        sig = check_m15_rsi_signal(df, df_m5=df_m5)
+
+    # 2. M15 RSI 均值回归策略扫描
+    # 💡 只有当主数据是 M15 时才触发，确保第 1 参数必须是 M15 数据！
+    elif timeframe == 'M15':
+        m15_df = df  # 当前推送的就是 M15 数据
+        
+        # 打印排查日志，确认 M5 是否成功传入
+        if df_m5 is None:
+            print("[scan_all_signals] ⚠️ 警告: 正在扫描 M15-RSI 信号，但 df_m5 为 None！")
+        else:
+            print(f"[scan_all_signals] ℹ️ 准备扫描 M15-RSI 信号: M15行数={len(m15_df)}, M5行数={len(df_m5)}")
+
+        sig = check_m15_rsi_signal(m15_df, df_m5=df_m5)
         if sig:
             signals.append(sig)
+
+    # 如果 timeframe == 'M5'，这里直接跳过，不用做单独处理（因为 M5 是作为辅助校验传给 M15 的）
+
     return signals

@@ -179,6 +179,17 @@ class GoldTrader:
             return df
         log.debug("M15数据来源: yfinance (fallback)")
         return self._get_yfinance_data('15m', '30d')
+    # 补全: M5 数据获取
+    # ═══════════════════════════════════════════════════════════════
+    def get_m5_data(self) -> Optional[pd.DataFrame]:
+        """获取M5数据: MT4本地 > yfinance"""
+        df = self._read_mt4_bars('bars_m5.json')
+        if df is not None:
+            log.debug("M5数据来源: MT4本地")
+            return df
+        log.debug("M5数据来源: yfinance (fallback)")
+        # yfinance 限制 5m 数据最大 period 为 60d（建议设置 7d 或 14d 以提升加载速度）
+        return self._get_yfinance_data('5m', '7d')
 
     # ── 风控与状态检查 ──
 
@@ -413,6 +424,7 @@ class GoldTrader:
         # 获取多时间框架数据
         df_h1 = self.get_hourly_data()
         df_m15 = self.get_m15_data()
+        df_m5 = self.get_m5_data()
         
         if df_h1 is None and df_m15 is None:
             return {"status": "error", "reason": "no_data"}
@@ -441,7 +453,7 @@ class GoldTrader:
         if df_h1 is not None:
             entries += self._check_entries(df_h1, 'H1', sentiment_ctx)
         if df_m15 is not None:
-            entries += self._check_entries(df_m15, 'M15', sentiment_ctx)
+            entries += self._check_entries(df_m15, 'M15', sentiment_ctx, df_m5=df_m5)
 
         total = len(exits) + len(entries)
         log.info(f"\n{'='*60}")
@@ -559,13 +571,14 @@ class GoldTrader:
         return exits
 
     def _check_entries(self, df: pd.DataFrame, timeframe: str = 'H1',
-                       sentiment_ctx: Optional[Dict] = None) -> List[Dict]:
+                       sentiment_ctx: Optional[Dict] = None,
+                       df_m5: Optional[pd.DataFrame] = None) -> List[Dict]:
         """检查新入场信号"""
         max_positions = getattr(config, 'MAX_POSITIONS', 2)
         current_positions = self.get_strategy_positions()
         
         if len(current_positions) >= max_positions:
-            _missed_signals = scan_all_signals(df, timeframe)
+            _missed_signals = scan_all_signals(df, timeframe, df_m5=df_m5)
             for _ms in _missed_signals:
                 self._log_missed_signal(_ms, f"持仓已满({len(current_positions)}/{max_positions})")
             if _missed_signals:
@@ -580,7 +593,7 @@ class GoldTrader:
         slots = max_positions - len(current_positions)
         log.info(f"\n  🔍 信号扫描 (可开 {slots} 笔):")
 
-        signals = scan_all_signals(df, timeframe)
+        signals = scan_all_signals(df, timeframe, df_m5=df_m5)
 
         if not signals:
             latest = df.iloc[-1]
@@ -682,6 +695,9 @@ class GoldTrader:
         df_m15 = self.get_m15_data()
         if df_m15 is not None:
             exits += self._check_exits(df_m15)
+        df_m5 = self.get_m5_data()
+        if df_m5 is not None:
+            exits += self._check_exits(df_m5)
         return {"exits": exits}
 
     # ── 外部控制接口 ──
