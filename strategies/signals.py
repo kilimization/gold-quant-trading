@@ -467,25 +467,17 @@ def check_exit_signal(df: pd.DataFrame, strategy: str, direction: str) -> Option
                 return "MACD空头出场: 柱状图转正"
 
     elif strategy in ("m5_rsi", "m15_rsi"):
-        rsi2 = float(latest["RSI2"])
-        close = float(latest["Close"])
-        sma20 = float(latest["SMA20"]) if "SMA20" in latest else None
+        rsi2 = float(latest["RSI2"]) if "RSI2" in latest else None
 
-    if not pd.isna(rsi2):
-        # 【做多出场条件】：
-        # 条件1: RSI(2) 真正冲高到极限超买区 (> 75/80)
-        # 条件2 (可选): 价格成功回归并突破 SMA20 均线
-        if direction == "BUY":
-            if rsi2 > 75:  # 调高阈值到 75
-                return f"M15 RSI多头离场: RSI(2)={rsi2:.1f} > 75 (动能饱和平仓)"
-            elif sma20 and close > sma20 and rsi2 > 50:
-                return f"M15 RSI多头离场: 价格已回归至 SMA20 上方 (${close:.2f})"
-        # 【做空出场条件】：
-        elif direction == "SELL":
-            if rsi2 < 25:  # 调低阈值到 25
-                return f"M15 RSI空头离场: RSI(2)={rsi2:.1f} < 25 (超卖探底平仓)"
-        elif sma20 and close < sma20 and rsi2 < 50:
-            return f"M15 RSI空头离场: 价格已回归至 SMA20 下方 (${close:.2f})"
+        if rsi2 is not None and not pd.isna(rsi2):
+            # 【做多离场】：仅当 RSI(2) 达到极值 > 85 时平仓
+            if direction == "BUY" and rsi2 > 85:
+                return f"M15 RSI多头离场: RSI(2)={rsi2:.1f} > 85 (动能饱和平仓)"
+
+            # 【做空离场】：仅当 RSI(2) 达到极值 < 25 时平仓
+            elif direction == "SELL" and rsi2 < 20:
+                return f"M15 RSI空头离场: RSI(2)={rsi2:.1f} < 20 (超卖探底平仓)"
+
     return None
 
 
@@ -499,11 +491,11 @@ import pandas as pd
 
 log = logging.getLogger(__name__)
 
-
+#===========================================================================
 def check_m15_rsi_signal(
     df: pd.DataFrame, df_m5: Optional[pd.DataFrame] = None
 ) -> Optional[Dict]:
-  """M15 RSI均值回归信号 (含全过程日志排查版)"""
+  """M15 RSI均值回归信号 """
 
   # --- 校验 0: 数据长度 ---
   if df is None:
@@ -889,17 +881,10 @@ def calc_auto_lot_size(atr: float, sl_distance: float) -> float:
 # 信号扫描入口
 # ═══════════════════════════════════════════════════════════════
 
-def scan_all_signals(
-    df: pd.DataFrame, 
-    timeframe: str = 'H1', 
-    df_m5: Optional[pd.DataFrame] = None,
-    df_m15: Optional[pd.DataFrame] = None
-) -> List[Dict]:
+def scan_all_signals(df: pd.DataFrame, timeframe: str = 'H1', df_m5: Optional[pd.DataFrame] = None) -> List[Dict]:
     """扫描所有已启用策略的信号"""
     import config as _scan_cfg
     signals = []
-
-    # 1. H1 级别策略扫描
     if timeframe == 'H1':
         sig = check_keltner_signal(df)
         if sig:
@@ -908,27 +893,14 @@ def scan_all_signals(
             sig = check_macd_signal(df)
             if sig:
                 signals.append(sig)
-        # ORB策略
+        # ORB策略 (也用H1数据)
         if _scan_cfg.ORB_ENABLED:
             sig = check_orb_signal(df)
             if sig:
                 signals.append(sig)
-
-    # 2. M15 RSI 均值回归策略扫描
-    # 💡 只有当主数据是 M15 时才触发，确保第 1 参数必须是 M15 数据！
-    elif timeframe == 'M15':
-        m15_df = df  # 当前推送的就是 M15 数据
-        
-        # 打印排查日志，确认 M5 是否成功传入
-        if df_m5 is None:
-            print("[scan_all_signals] ⚠️ 警告: 正在扫描 M15-RSI 信号，但 df_m5 为 None！")
-        else:
-            print(f"[scan_all_signals] ℹ️ 准备扫描 M15-RSI 信号: M15行数={len(m15_df)}, M5行数={len(df_m5)}")
-
-        sig = check_m15_rsi_signal(m15_df, df_m5=df_m5)
+    elif timeframe in ('M5', 'M15'):
+        # 修正：将 df_m5 正确传递给 check_m15_rsi_signal
+        sig = check_m15_rsi_signal(df, df_m5=df_m5)
         if sig:
             signals.append(sig)
-
-    # 如果 timeframe == 'M5'，这里直接跳过，不用做单独处理（因为 M5 是作为辅助校验传给 M15 的）
-
     return signals
