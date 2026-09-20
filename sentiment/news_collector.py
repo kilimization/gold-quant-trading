@@ -228,7 +228,9 @@ _ECONOMIC_CALENDAR_2026: List[Dict] = [
     {"name": "CPI (Dec)", "datetime_utc": _dt(1, 14, 13, 30), "impact": "HIGH", "currency": "USD"},
     {"name": "PPI (Dec)", "datetime_utc": _dt(1, 15, 13, 30), "impact": "MEDIUM", "currency": "USD"},
     {"name": "NFP (Jan)", "datetime_utc": _dt(1, 10, 13, 30), "impact": "HIGH", "currency": "USD"},
-    {"name": "FOMC Rate Decision", "datetime_utc": _dt(1, 29, 19, 0), "impact": "EXTREME", "currency": "USD"},
+    # 决议日 = FOMC 会议第二天 (Fed官方2026日程: federalreserve.gov/monetarypolicy/fomccalendars.htm)
+    # 1/27-28, 3/17-18, 4/28-29, 6/16-17, 7/28-29, 9/15-16, 10/27-28, 12/8-9
+    {"name": "FOMC Rate Decision", "datetime_utc": _dt(1, 28, 19, 0), "impact": "EXTREME", "currency": "USD"},
 
     # --- February ---
     {"name": "NFP (Feb)", "datetime_utc": _dt(2, 7, 13, 30), "impact": "HIGH", "currency": "USD"},
@@ -248,12 +250,12 @@ _ECONOMIC_CALENDAR_2026: List[Dict] = [
     {"name": "NFP (Apr)", "datetime_utc": _dt(4, 3, 12, 30), "impact": "HIGH", "currency": "USD"},
     {"name": "CPI (Mar)", "datetime_utc": _dt(4, 10, 12, 30), "impact": "HIGH", "currency": "USD"},
     {"name": "PPI (Mar)", "datetime_utc": _dt(4, 11, 12, 30), "impact": "MEDIUM", "currency": "USD"},
+    {"name": "FOMC Rate Decision", "datetime_utc": _dt(4, 29, 18, 0), "impact": "EXTREME", "currency": "USD"},
     {"name": "PCE Core (Mar)", "datetime_utc": _dt(4, 30, 12, 30), "impact": "HIGH", "currency": "USD"},
     {"name": "GDP (Q1 1st)", "datetime_utc": _dt(4, 29, 12, 30), "impact": "HIGH", "currency": "USD"},
 
     # --- May ---
     {"name": "NFP (May)", "datetime_utc": _dt(5, 1, 12, 30), "impact": "HIGH", "currency": "USD"},
-    {"name": "FOMC Rate Decision", "datetime_utc": _dt(5, 6, 18, 0), "impact": "EXTREME", "currency": "USD"},
     {"name": "CPI (Apr)", "datetime_utc": _dt(5, 13, 12, 30), "impact": "HIGH", "currency": "USD"},
     {"name": "PPI (Apr)", "datetime_utc": _dt(5, 14, 12, 30), "impact": "MEDIUM", "currency": "USD"},
 
@@ -292,12 +294,12 @@ _ECONOMIC_CALENDAR_2026: List[Dict] = [
     {"name": "NFP (Oct)", "datetime_utc": _dt(10, 2, 12, 30), "impact": "HIGH", "currency": "USD"},
     {"name": "CPI (Sep)", "datetime_utc": _dt(10, 13, 12, 30), "impact": "HIGH", "currency": "USD"},
     {"name": "PPI (Sep)", "datetime_utc": _dt(10, 14, 12, 30), "impact": "MEDIUM", "currency": "USD"},
+    {"name": "FOMC Rate Decision", "datetime_utc": _dt(10, 28, 18, 0), "impact": "EXTREME", "currency": "USD"},
     {"name": "GDP (Q3 1st)", "datetime_utc": _dt(10, 29, 12, 30), "impact": "HIGH", "currency": "USD"},
     {"name": "PCE Core (Sep)", "datetime_utc": _dt(10, 30, 12, 30), "impact": "HIGH", "currency": "USD"},
 
     # --- November ---
     {"name": "NFP (Nov)", "datetime_utc": _dt(11, 6, 13, 30), "impact": "HIGH", "currency": "USD"},
-    {"name": "FOMC Rate Decision", "datetime_utc": _dt(11, 4, 19, 0), "impact": "EXTREME", "currency": "USD"},
     {"name": "CPI (Oct)", "datetime_utc": _dt(11, 12, 13, 30), "impact": "HIGH", "currency": "USD"},
     {"name": "PPI (Oct)", "datetime_utc": _dt(11, 13, 13, 30), "impact": "MEDIUM", "currency": "USD"},
     {"name": "GDP (Q3 2nd)", "datetime_utc": _dt(11, 25, 13, 30), "impact": "MEDIUM", "currency": "USD"},
@@ -307,7 +309,38 @@ _ECONOMIC_CALENDAR_2026: List[Dict] = [
     {"name": "NFP (Dec)", "datetime_utc": _dt(12, 4, 13, 30), "impact": "HIGH", "currency": "USD"},
     {"name": "CPI (Nov)", "datetime_utc": _dt(12, 10, 13, 30), "impact": "HIGH", "currency": "USD"},
     {"name": "PPI (Nov)", "datetime_utc": _dt(12, 11, 13, 30), "impact": "MEDIUM", "currency": "USD"},
-    {"name": "FOMC Rate Decision", "datetime_utc": _dt(12, 16, 19, 0), "impact": "EXTREME", "currency": "USD"},
+    {"name": "FOMC Rate Decision", "datetime_utc": _dt(12, 9, 19, 0), "impact": "EXTREME", "currency": "USD"},
     {"name": "GDP (Q3 3rd)", "datetime_utc": _dt(12, 22, 13, 30), "impact": "MEDIUM", "currency": "USD"},
     {"name": "PCE Core (Nov)", "datetime_utc": _dt(12, 23, 13, 30), "impact": "HIGH", "currency": "USD"},
 ]
+
+
+def validate_calendar(calendar: List[Dict] = None) -> List[str]:
+    """
+    自检硬编码日历的明显错误, 返回问题描述列表 (供启动时打印告警)
+
+    检查项:
+      1. 落在周六/周日的发布 (BLS/BEA/Fed 从不在周末发布数据)
+      2. 同一个时间点重复登记两条事件
+    这类日期错误会让避险逻辑在错误的日子暂停交易, 同时放过真正的风险事件。
+    """
+    events = _ECONOMIC_CALENDAR_2026 if calendar is None else calendar
+    problems: List[str] = []
+    seen = {}
+
+    for ev in events:
+        dt = ev["datetime_utc"]
+        if dt.weekday() >= 5:
+            problems.append(
+                f"{dt:%Y-%m-%d %H:%M} ({'周六' if dt.weekday() == 5 else '周日'}) "
+                f"{ev['name']} — 周末不可能有该数据发布"
+            )
+        key = dt.isoformat()
+        if key in seen:
+            problems.append(
+                f"{dt:%Y-%m-%d %H:%M} 重复登记: {seen[key]} 与 {ev['name']}"
+            )
+        else:
+            seen[key] = ev["name"]
+
+    return problems

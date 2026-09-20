@@ -10,7 +10,9 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
-from sentiment.news_collector import NewsCollector, _ECONOMIC_CALENDAR_2026
+from sentiment.news_collector import (
+    NewsCollector, _ECONOMIC_CALENDAR_2026, validate_calendar,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,24 @@ class CalendarGuard:
 
     def __init__(self, news_collector: Optional[NewsCollector] = None):
         self._collector = news_collector or NewsCollector()
+        self._log_calendar_problems()
+
+    def _log_calendar_problems(self):
+        """启动时自检硬编码日历: 周末发布/重复登记都会被点名告警"""
+        try:
+            problems = validate_calendar()
+        except Exception as exc:            # 自检本身绝不能影响交易
+            logger.warning(f"[日历自检] 执行失败: {exc}")
+            return
+        if problems:
+            logger.warning(
+                f"[日历自检] ⚠️ 硬编码经济日历发现 {len(problems)} 处可疑日期, "
+                f"避险窗口可能在错误的日子生效/失效, 请核对官方发布日程:"
+            )
+            for p in problems:
+                logger.warning(f"[日历自检]   - {p}")
+        else:
+            logger.info("[日历自检] 经济日历未发现明显日期问题")
 
     def should_pause_trading(self) -> Tuple[bool, str]:
         """Check if trading should be paused right now.

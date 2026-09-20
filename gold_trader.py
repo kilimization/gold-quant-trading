@@ -13,6 +13,9 @@ from strategies.signals import (
     prepare_indicators, scan_all_signals, check_exit_signal,
     get_orb_strategy, calc_auto_lot_size
 )
+from strategies.risk import (
+    next_trailing_sl, server_time_str, check_risk_config, breakeven_winrate,
+)
 import notifier
 
 # 舆情分析模块 (安全导入，失败不影响交易)
@@ -23,12 +26,31 @@ except Exception as _import_err:
     SENTIMENT_AVAILABLE = False
     logging.getLogger(__name__).warning(f"舆情模块导入失败: {_import_err}")
 
-# 策略默认止损止盈 (美元)
-STRATEGY_PARAMS = {
-    'keltner': {'sl': 20, 'tp': 35, 'max_bars': 15},
-    'macd': {'sl': 20, 'tp': 50, 'max_bars': 20},
-    'm15_rsi': {'sl': 15, 'tp': 0, 'max_bars': 12},  # RSI出场，不用固定止盈
-}
+# 策略所属时间框架 → K线分钟数
+# 用于把 config.STRATEGIES[...]['max_hold_bars'] 正确换算成持仓小时数。
+# (旧代码把 max_hold_bars 直接当成"天"用, 导致 12根M15(3小时) 实际变成 12天;
+#  另外旧的 STRATEGY_PARAMS 字典是死代码, 且参数与 config.STRATEGIES 不一致, 已删除)
+_BAR_MINUTES = {'H1': 60, 'M15': 15, 'M5': 5}
+
+
+def _strategy_timeframe(strategy: str) -> Optional[str]:
+    """取策略时间框架; 未配置的策略返回 None (视为"手动/未知单")"""
+    entry = getattr(config, 'STRATEGIES', {}).get(strategy)
+    if isinstance(entry, dict):
+        return entry.get('timeframe', 'H1')
+    return None
+
+
+def _max_hold_hours(strategy: str) -> float:
+    """把 max_hold_bars 换算成持仓小时上限"""
+    entry = getattr(config, 'STRATEGIES', {}).get(strategy)
+    if not isinstance(entry, dict):
+        # 未配置的策略(无法识别来源的持仓): 保持修复前的宽限期(15天),
+        # 不做激进改动 —— 这类单的止损止盈由MT4硬保护
+        return 15 * 24.0
+    bars = entry.get('max_hold_bars', 15)
+    tf = entry.get('timeframe', 'H1')
+    return float(bars) * _BAR_MINUTES.get(tf, 60) / 60.0
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +77,11 @@ class GoldTrader:
         
         # 冷却期跟踪: {strategy: 上次亏损时间}
         self.cooldown_until = {}
+        
+        # 待认领的信号K线时间: {strategy: 服务器时间字符串}
+        # 下单时记下信号所在的K线, 等持仓出现在 positions.json 后写进tracking,
+        # 这样后续移动止损重画图表时箭头仍锚定在原始信号K线上。
+        self.pending_signal_time = {}
         
         # 日内状态跟踪
         self.daily_pnl = 0.0
@@ -302,7 +329,10 @@ class GoldTrader:
         for pos in mt4_positions:
             tk = str(pos['ticket'])
             if tk in self.tracking:
-                self.tracking[tk]['last_profit'] = pos.get('profit', 0)
+                try:
+                    self.tracking[tk]['last_profit'] = float(pos.get('profit') or 0)
+                except (TypeError, ValueError):
+                    self.tracking[tk]['last_profit'] = 0.0
                 self.tracking[tk]['last_price'] = pos.get('current_price', 0)
         self._save_tracking()
         
@@ -314,13 +344,14 @@ class GoldTrader:
                 strategy = track.get('strategy', 'unknown')
                 direction = track.get('direction', 'BUY')
                 entry_price = track.get('entry_price', 0)
-                last_profit = track.get('last_profit', 0)
+                # 防御性转换: MT4桥接文件里可能是 None / 字符串, 直接拿去格式化或
+                # 参与算术会抛异常, 进而中断整个扫描周期 (账目与日亏损熔断都不更新)
+                last_profit = float(track.get('last_profit') or 0)
                 default_lot = getattr(config, 'LOT_SIZE', 0.01)
                 lots = track.get('lots', default_lot)
                 
                 log.info(f"  ⚠️ 检测到 #{ticket_key} ({strategy}) 已被MT4平仓")
                 log.info(f"     估算盈亏: ${last_profit:+.2f} (开仓价: {entry_price})")
-                notifier.notify_close(int(ticket_key), strategy, last_profit, 'MT4自动平仓(止损或手动)')
                 
                 # 更新总盈亏
                 self.total_pnl['total_pnl'] = round(self.total_pnl.get('total_pnl', 0) + last_profit, 2)
@@ -350,6 +381,14 @@ class GoldTrader:
                 
                 del self.tracking[ticket_key]
                 self._save_tracking()
+                
+                # 通知放在所有账务处理【之后】: 旧代码把它放在最前面,
+                # 一旦通知抛异常, 上面的盈亏/熔断/冷却/移除tracking全部不会执行,
+                # 而持仓已从MT4消失 → 每个扫描周期都重复报警且账目永远对不上。
+                try:
+                    notifier.notify_close(int(ticket_key), strategy, last_profit, 'MT4自动平仓(止损或手动)')
+                except Exception as e:
+                    log.warning(f"     ⚠️ 平仓通知发送失败 (不影响记账): {e}")
         
         # 3. 检测未 tracking 的新仓位
         for pos in mt4_positions:
@@ -379,6 +418,10 @@ class GoldTrader:
                     'entry_date': pos.get('open_time', datetime.now().isoformat()),
                     'lots': pos.get('lots', 0),
                     'sl': pos.get('sl', 0),
+                    'sl_price': pos.get('sl', 0),
+                    'tp_price': pos.get('tp', 0),
+                    # 认领下单时记录的信号K线时间 (供图表箭头锚定; 重启后为空则EA退化到当前K线)
+                    'signal_time': self.pending_signal_time.pop(strategy, ''),
                 }
                 self._save_tracking()
                 log.info(f"  📝 同步新仓位: #{ticket_key} {strategy} {direction} @ {pos.get('open_price', 0)}")
@@ -441,12 +484,12 @@ class GoldTrader:
             m15_rsi = float(m15_latest['RSI2']) if not pd.isna(m15_latest.get('RSI2')) else 50
             log.info(f"  XAU/USD M15: RSI(2): {m15_rsi:.1f}")
 
-        # Step 1: 检查现有持仓出场
+        # Step 1: 检查现有持仓出场 (按策略自己的时间框架)
         exits = []
         if df_h1 is not None:
-            exits += self._check_exits(df_h1)
+            exits += self._check_exits(df_h1, 'H1')
         if df_m15 is not None:
-            exits += self._check_exits(df_m15)
+            exits += self._check_exits(df_m15, 'M15')
 
         # Step 2: 检查新入场信号
         entries = []
@@ -494,8 +537,13 @@ class GoldTrader:
 
         return {"exits": exits, "entries": entries}
 
-    def _check_exits(self, df: pd.DataFrame) -> List[Dict]:
-        """检查出场信号"""
+    def _check_exits(self, df: pd.DataFrame, timeframe: str = 'H1') -> List[Dict]:
+        """
+        检查出场信号
+
+        timeframe: 当前传入 df 的时间框架。只对"属于该时间框架"的策略做检查,
+        否则 M15 持仓会被用 H1 的 RSI(2) 判定出场(反之亦然), 造成误平/重复平仓。
+        """
         positions = self.get_strategy_positions()
         if not positions:
             log.info(f"  📭 无策略持仓")
@@ -503,7 +551,7 @@ class GoldTrader:
 
         now = datetime.now()
         exits = []
-        log.info(f"\n  📋 持仓监控 ({len(positions)} 笔):")
+        log.info(f"\n  📋 持仓监控 ({len(positions)} 笔, {timeframe} 数据):")
 
         for pos in positions:
             ticket = pos.get('ticket', 0)
@@ -515,17 +563,26 @@ class GoldTrader:
             track_key = str(ticket)
             track = self.tracking.get(track_key, {})
             strategy = track.get('strategy', 'unknown')
+
+            # 只处理属于当前时间框架的策略; 未识别的持仓只在 H1 这一轮处理一次
+            own_tf = _strategy_timeframe(strategy)
+            if own_tf is None:
+                if timeframe != 'H1':
+                    continue
+            elif own_tf != timeframe:
+                continue
+
             entry_date_str = track.get('entry_date', now.isoformat())
             try:
                 entry_date = datetime.fromisoformat(entry_date_str)
             except Exception:
                 entry_date = now
-            hold_days = (now - entry_date).days
+            hold_hours = (now - entry_date).total_seconds() / 3600
 
             pnl_pct = (current_price - open_price) / open_price * 100 if open_price > 0 else 0
             emoji = "🟢" if profit >= 0 else "🔴"
             log.info(f"    {emoji} #{ticket} {strategy}: {lots}手 @ {open_price:.2f} "
-                     f"→ {current_price:.2f} ({pnl_pct:+.2f}%) ${profit:+.2f} {hold_days}天")
+                     f"→ {current_price:.2f} ({pnl_pct:+.2f}%) ${profit:+.2f} {hold_hours:.1f}小时")
 
             reason = None
             direction = track.get('direction', 'BUY')
@@ -535,22 +592,20 @@ class GoldTrader:
             if exit_sig:
                 reason = exit_sig
 
-            # 2. 时间止损
-            strat_configs = getattr(config, 'STRATEGIES', {})
-            max_hold = strat_configs.get(strategy, {}).get('max_hold_bars', 15)
-            if not reason and hold_days >= max_hold:
-                reason = f"⏰ 时间止损: {hold_days}天 >= {max_hold}天"
+            # 2. 时间止损 (按策略时间框架换算: 12根M15 = 3小时)
+            max_hold_hours = _max_hold_hours(strategy)
+            if not reason and hold_hours >= max_hold_hours:
+                reason = f"⏰ 时间止损: 已持仓{hold_hours:.1f}小时 >= {max_hold_hours:.1f}小时"
 
             if reason:
                 log.info(f"      → {reason}")
                 success = self.bridge.close_order(ticket)
-
                 trade = {
                     'action': 'CLOSE', 'ticket': ticket,
                     'strategy': strategy, 'lots': lots,
                     'open_price': open_price, 'close_price': current_price,
                     'profit': profit, 'pnl_pct': round(pnl_pct, 2),
-                    'reason': reason, 'hold_days': hold_days,
+                    'reason': reason, 'hold_hours': round(hold_hours, 2),
                     'time': now.isoformat(),
                 }
                 exits.append(trade)
@@ -566,9 +621,65 @@ class GoldTrader:
                         del self.tracking[track_key]
                         self._save_tracking()
             else:
+                # 3. 保本 / 移动止损: 浮盈达标后把止损往有利方向推
+                self._manage_trailing(pos, track, df, track_key, strategy, direction)
                 log.info(f"      → 继续持有")
 
         return exits
+
+    def _manage_trailing(self, pos: Dict, track: Dict, df: pd.DataFrame,
+                         track_key: str, strategy: str, direction: str) -> Optional[float]:
+        """
+        保本 + 移动止损
+
+        只把止损朝有利方向移动, 绝不放宽; 移动量不足 TRAIL_MIN_STEP 不发单。
+        任何异常都只记录日志 —— 一个持仓的跟踪失败不能影响其他持仓的处理。
+        """
+        try:
+            ticket = pos.get('ticket', 0)
+            price = float(pos.get('current_price') or 0)
+            entry = float(track.get('entry_price') or pos.get('open_price') or 0)
+            current_sl = float(pos.get('sl') or track.get('sl_price') or 0)
+            tp_price = float(pos.get('tp') or track.get('tp_price') or 0)
+
+            try:
+                atr = float(df.iloc[-1]['ATR'])
+            except Exception:
+                atr = float('nan')
+            if pd.isna(atr) or atr <= 0 or price <= 0 or entry <= 0:
+                return None
+
+            new_sl = next_trailing_sl(direction, entry, current_sl, price, atr, tp_price)
+            if not new_sl:
+                return None
+
+            profit_dist = (price - entry) if direction == 'BUY' else (entry - price)
+            log.info(f"      🎯 移动止损: {current_sl:.2f} → {new_sl:.2f} "
+                     f"(浮盈${profit_dist:.2f}, ATR=${atr:.2f})")
+
+            if not self.bridge.modify_order(ticket, sl=new_sl, tp=0):
+                log.warning("      ⚠️ 修改止损失败 (MT4拒绝或超时), 下轮重试")
+                return None
+
+            if track_key in self.tracking:
+                self.tracking[track_key]['sl_price'] = new_sl
+                self._save_tracking()
+
+            # 图表上的止损虚线同步移动 (箭头仍锚定原信号K线)
+            self.bridge.annotate(
+                strategy=strategy,
+                direction=direction,
+                entry=entry,
+                sl=new_sl,
+                tp=tp_price,
+                signal_time=track.get('signal_time', ''),
+                label=f"移动止损 → {new_sl:.2f}",
+                ticket=ticket,
+            )
+            return new_sl
+        except Exception as e:
+            log.warning(f"      ⚠️ 移动止损处理异常 (不影响持仓): {e}")
+            return None
 
     def _check_entries(self, df: pd.DataFrame, timeframe: str = 'H1',
                        sentiment_ctx: Optional[Dict] = None,
@@ -599,7 +710,7 @@ class GoldTrader:
             latest = df.iloc[-1]
             rsi2 = float(latest['RSI2']) if not pd.isna(latest.get('RSI2')) else 100
             if rsi2 < 20:
-                log.info(f"    👀 RSI(2)={rsi2:.1f} 接近触发 (阈值<5)")
+                log.info(f"    👀 RSI(2)={rsi2:.1f} 接近触发 (阈值<15)")
             else:
                 log.info(f"    → 无信号")
             return []
@@ -681,7 +792,30 @@ class GoldTrader:
                 self._save_trade_log()
 
                 log.info(f"    ✅ 已下单: {actual_lots}手 止损${sl_pips:.1f} 止盈${tp_pips:.1f}")
-                notifier.notify_open(strategy, direction, actual_lots, close, sl_pips, reason)
+                try:
+                    notifier.notify_open(strategy, direction, actual_lots, close, sl_pips, reason)
+                except Exception as e:
+                    # 通知失败绝不能影响已成交订单的记账
+                    log.warning(f"    ⚠️ 开仓通知发送失败 (订单已成交, 不影响记账): {e}")
+
+                # 在主图表上标注推荐的止损/止盈 (箭头 + 虚线 + 价格标签)
+                # 纯可视化: 走独立的 annotate.json, 失败不影响交易
+                lv = getattr(self.bridge, 'last_levels', {}) or {}
+                sig_time = server_time_str(sig.get('bar_time'))
+                # 记下信号K线, 等持仓出现后写进tracking (供移动止损重画时箭头不跑位)
+                self.pending_signal_time[strategy] = sig_time
+                if lv.get('sl'):
+                    self.bridge.annotate(
+                        strategy=strategy,
+                        direction=direction,
+                        entry=lv.get('price') or close,
+                        sl=lv.get('sl'),
+                        tp=lv.get('tp') or 0,
+                        signal_time=sig_time,
+                        label=reason[:120],
+                        ticket=0,
+                    )
+                    log.info(f"    🖍️ 已标注推荐止损/止盈: SL={lv.get('sl')} TP={lv.get('tp')}")
 
         return entries
 
@@ -691,13 +825,13 @@ class GoldTrader:
         exits = []
         df_h1 = self.get_hourly_data()
         if df_h1 is not None:
-            exits += self._check_exits(df_h1)
+            exits += self._check_exits(df_h1, 'H1')
         df_m15 = self.get_m15_data()
         if df_m15 is not None:
-            exits += self._check_exits(df_m15)
-        df_m5 = self.get_m5_data()
-        if df_m5 is not None:
-            exits += self._check_exits(df_m5)
+            exits += self._check_exits(df_m15, 'M15')
+#        df_m5 = self.get_m5_data()
+#        if df_m5 is not None:
+#            exits += self._check_exits(df_m5)
         return {"exits": exits}
 
     # ── 外部控制接口 ──

@@ -102,15 +102,40 @@ GOLD_KEYWORDS = {
 TRUMP_AMPLIFIER = 1.3
 
 # ---------------------------------------------------------------------------
+# 关键字否定形式排除表
+# ---------------------------------------------------------------------------
+# 子串匹配会把"被否定的词"也当成原词命中。最典型的例子:
+#   "de-escalation"(局势降温, 利空黄金) 同时命中 "escalat"(+0.25) 和
+#   "de-escalat"(-0.20), 净得分 +0.05 → 反而被判定为【利好黄金/看涨】,
+#   与 GOLD_KEYWORDS 里设置 "de-escalat" 的意图完全相反。
+# 这里声明: 当文本中出现了这些"否定形式"时, 原关键词不再计分。
+_KEYWORD_NEGATED_BY = {
+    "escalat": ("de-escalat",),
+}
+
+
+def _keyword_hits(keyword: str, text_lower: str) -> bool:
+    """关键字命中判断 (排除被否定的复合词)"""
+    if keyword not in text_lower:
+        return False
+    return not any(neg in text_lower for neg in _KEYWORD_NEGATED_BY.get(keyword, ()))
+
+# ---------------------------------------------------------------------------
 # VADER setup (lazy init)
 # ---------------------------------------------------------------------------
 _vader_analyzer = None
+_vader_attempted = False
 
 
 def _get_vader():
-    global _vader_analyzer
+    global _vader_analyzer, _vader_attempted
     if _vader_analyzer is not None:
         return _vader_analyzer
+    # 失败缓存: 与 _get_finbert 保持一致。否则 nltk 词典缺失时, 每个分析周期
+    # 都会重试 nltk.download (联网) 并静默用 0.0 代替 VADER 分数。
+    if _vader_attempted:
+        return None
+    _vader_attempted = True
     try:
         import nltk
         from nltk.sentiment.vader import SentimentIntensityAnalyzer
@@ -122,7 +147,7 @@ def _get_vader():
         logger.info("[情绪分析] VADER模型加载成功")
         return _vader_analyzer
     except Exception as exc:
-        logger.error(f"[情绪分析] VADER加载失败: {exc}")
+        logger.error(f"[情绪分析] VADER加载失败 (不再重试): {exc}")
         return None
 
 
@@ -225,17 +250,17 @@ class SentimentAnalyzer:
         """Gold-specific keyword scoring — PRIMARY signal."""
         total_score = 0.0
         matched_count = 0
-        has_trump = False
-        
+                
         for headline in headlines:
             h_lower = headline.lower()
             headline_score = 0.0
             
-            if "trump" in h_lower:
-                has_trump = True
+            # has_trump 必须是"每条新闻各自判定": 旧代码把它留在循环外,
+            # 只要批次里有一条提到Trump, 后面所有新闻都会被 ×1.3 放大。
+            has_trump = "trump" in h_lower
             
             for keyword, weight in GOLD_KEYWORDS.items():
-                if keyword in h_lower:
+                if _keyword_hits(keyword, h_lower):
                     headline_score += weight
                     matched_count += 1
             

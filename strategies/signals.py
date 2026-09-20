@@ -20,6 +20,10 @@ import pandas as pd
 from typing import Dict, Optional, List
 from datetime import datetime
 
+import config
+
+from .risk import calc_dynamic_levels, server_time_str
+
 log = logging.getLogger(__name__)
 
 
@@ -265,8 +269,9 @@ class KeltnerStateMachine:
         """Phase 3: 等待突破确认"""
         self.window_bars_left -= 1
 
-        sl = _calc_atr_stop(df)
-        tp = _calc_atr_tp(df)
+        # 与 check_keltner_signal 保持一致的动态档位 (状态机版本当前未被启用)
+        _lv = calc_dynamic_levels(df, direction=self.direction, entry=close)
+        sl, tp = _lv['sl'], _lv['tp']
 
         if self.direction == 'BUY':
             # 价格突破窗口上沿 → 入场
@@ -365,29 +370,35 @@ def check_keltner_signal(df: pd.DataFrame) -> Optional[Dict]:
     if adx < ADX_TREND_THRESHOLD:
         return None
     
-    sl = _calc_atr_stop(df)
-    tp = _calc_atr_tp(df)
-    
     # 做多: 突破上轨 + 价格>EMA100
     if close > kc_upper and close > ema100:
+        # 动态档位: 止损放前N根K线低点外侧; 止盈取结构目标/ATR兜底
+        lv = calc_dynamic_levels(df, direction='BUY', entry=close)
         return {
             'strategy': 'keltner',
             'signal': 'BUY',
-            'reason': f"Keltner做多: 价格{close:.2f} > 上轨{kc_upper:.2f} (ADX={adx:.1f})",
+            'reason': f"Keltner做多: 价格{close:.2f} > 上轨{kc_upper:.2f} (ADX={adx:.1f}) | {lv['reason']}",
             'close': close,
-            'sl': sl,
-            'tp': tp,
+            'sl': lv['sl'],
+            'tp': lv['tp'],
+            'atr': lv['atr'],
+            'regime': lv['regime'],
+            'bar_time': df.index[-1],
         }
     
     # 做空: 跌破下轨 + 价格<EMA100
     if close < kc_lower and close < ema100:
+        lv = calc_dynamic_levels(df, direction='SELL', entry=close)
         return {
             'strategy': 'keltner',
             'signal': 'SELL',
-            'reason': f"Keltner做空: 价格{close:.2f} < 下轨{kc_lower:.2f} (ADX={adx:.1f})",
+            'reason': f"Keltner做空: 价格{close:.2f} < 下轨{kc_lower:.2f} (ADX={adx:.1f}) | {lv['reason']}",
             'close': close,
-            'sl': sl,
-            'tp': tp,
+            'sl': lv['sl'],
+            'tp': lv['tp'],
+            'atr': lv['atr'],
+            'regime': lv['regime'],
+            'bar_time': df.index[-1],
         }
     
     return None
@@ -415,29 +426,34 @@ def check_macd_signal(df: pd.DataFrame) -> Optional[Dict]:
     if adx < ADX_TREND_THRESHOLD:
         return None
 
-    sl = _calc_atr_stop(df)
-    tp = _calc_atr_tp(df)
-
     # 做多: MACD转正 + 价格>EMA100
     if macd_hist > 0 and macd_hist_prev <= 0 and close > ema100:
+        lv = calc_dynamic_levels(df, direction='BUY', entry=close)
         return {
             'strategy': 'macd',
             'signal': 'BUY',
-            'reason': f"MACD做多: 柱状图转正, 价格{close:.2f} > EMA100 (ADX={adx:.1f})",
+            'reason': f"MACD做多: 柱状图转正, 价格{close:.2f} > EMA100 (ADX={adx:.1f}) | {lv['reason']}",
             'close': close,
-            'sl': sl,
-            'tp': tp,
+            'sl': lv['sl'],
+            'tp': lv['tp'],
+            'atr': lv['atr'],
+            'regime': lv['regime'],
+            'bar_time': df.index[-1],
         }
 
     # 做空: MACD转负 + 价格<EMA100
     if macd_hist < 0 and macd_hist_prev >= 0 and close < ema100:
+        lv = calc_dynamic_levels(df, direction='SELL', entry=close)
         return {
             'strategy': 'macd',
             'signal': 'SELL',
-            'reason': f"MACD做空: 柱状图转负, 价格{close:.2f} < EMA100 (ADX={adx:.1f})",
+            'reason': f"MACD做空: 柱状图转负, 价格{close:.2f} < EMA100 (ADX={adx:.1f}) | {lv['reason']}",
             'close': close,
-            'sl': sl,
-            'tp': tp,
+            'sl': lv['sl'],
+            'tp': lv['tp'],
+            'atr': lv['atr'],
+            'regime': lv['regime'],
+            'bar_time': df.index[-1],
         }
 
     return None
@@ -466,7 +482,7 @@ def check_exit_signal(df: pd.DataFrame, strategy: str, direction: str) -> Option
             elif direction == 'SELL' and macd_hist > 0 and macd_hist_prev <= 0:
                 return "MACD空头出场: 柱状图转正"
 
-    elif strategy in ("m5_rsi", "m15_rsi"):
+    elif strategy == 'm15_rsi':
         rsi2 = float(latest["RSI2"]) if "RSI2" in latest else None
 
         if rsi2 is not None and not pd.isna(rsi2):
@@ -474,7 +490,7 @@ def check_exit_signal(df: pd.DataFrame, strategy: str, direction: str) -> Option
             if direction == "BUY" and rsi2 > 85:
                 return f"M15 RSI多头离场: RSI(2)={rsi2:.1f} > 85 (动能饱和平仓)"
 
-            # 【做空离场】：仅当 RSI(2) 达到极值 < 25 时平仓
+            # 【做空离场】：仅当 RSI(2) 达到极值 < 20 时平仓
             elif direction == "SELL" and rsi2 < 20:
                 return f"M15 RSI空头离场: RSI(2)={rsi2:.1f} < 20 (超卖探底平仓)"
 
@@ -492,188 +508,259 @@ import pandas as pd
 log = logging.getLogger(__name__)
 
 #===========================================================================
+import time
+import pandas as pd
+from typing import Optional, Dict
+
+# --- 记录上一次开仓时间 (全局变量/模块级变量) ---
+_LAST_BUY_TIME: float = 0.0
+_LAST_SELL_TIME: float = 0.0
+
+# M15 RSI 止损参数
+# 说明: 旧代码写成 `sl = min(max(_calc_atr_stop(df), 3.0), 10.0)`, 但
+# _calc_atr_stop() 的下限本身就是 10, 所以结果恒等于 $10 —— ATR 完全失效,
+# 而且 min(...) 的 10.0 上限把 [3, 10] 的区间夹成了单点。
+M15_RSI_SL_ATR_MULTIPLIER = 2.5   # 止损 = 2.5 × M15 ATR
+M15_RSI_SL_MIN = 3.0              # 最紧 $3
+M15_RSI_SL_MAX = 10.0             # 最松 $10
+M15_RSI_SL_DEFAULT = 8.0          # ATR 无效时的默认值
+
+
+def _calc_m15_rsi_stop(df: pd.DataFrame) -> float:
+    """M15 RSI 止损: 2.5×ATR, 收窄到 [$3, $10]"""
+    try:
+        atr = float(df.iloc[-1]['ATR'])
+    except (KeyError, IndexError, TypeError, ValueError):
+        atr = float('nan')
+    if pd.isna(atr) or atr <= 0:
+        return M15_RSI_SL_DEFAULT
+    sl = atr * M15_RSI_SL_ATR_MULTIPLIER
+    return round(min(max(sl, M15_RSI_SL_MIN), M15_RSI_SL_MAX), 2)
+
+
 def check_m15_rsi_signal(
     df: pd.DataFrame, df_m5: Optional[pd.DataFrame] = None
 ) -> Optional[Dict]:
-  """M15 RSI均值回归信号 """
+    """M15 RSI均值回归信号 (支持 10 分钟冷却限制)"""
+    global _LAST_BUY_TIME, _LAST_SELL_TIME
 
-  # --- 校验 0: 数据长度 ---
-  if df is None:
-    print("[M15-RSI] ❌ 失败: M15 数据源为空 (df is None)")
-    return None
-  if len(df) < 55:
-    print(f"[M15-RSI] ❌ 失败: M15 数据行数不足 (当前: {len(df)} 行, 需要 >= 55)")
-    return None
+    # --- 校验 0: 数据长度 ---
+    if df is None:
+        print("[M15-RSI] ❌ 失败: M15 数据源为空 (df is None)")
+        return None
+    if len(df) < 55:
+        print(f"[M15-RSI] ❌ 失败: M15 数据行数不足 (当前: {len(df)} 行, 需要 >= 55)")
+        return None
 
-  # 确保 df (M15) 按时间升序排列
-  time_col = "t" if "t" in df.columns else ("Time" if "Time" in df.columns else None)
-  if time_col:
-    df[time_col] = pd.to_datetime(df[time_col])
-    df = df.sort_values(time_col, ascending=True).reset_index(drop=True)
+    # 确保 df (M15) 按时间升序排列
+    time_col = "t" if "t" in df.columns else ("Time" if "Time" in df.columns else None)
+    if time_col:
+        df[time_col] = pd.to_datetime(df[time_col])
+        df = df.sort_values(time_col, ascending=True).reset_index(drop=True)
 
-  latest = df.iloc[-1]
-  prev = df.iloc[-2]  # 提取前一根 M15 K 线
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]  # 提取前一根 M15 K 线
 
-  close = float(latest["Close"])
+    close = float(latest["Close"])
 
-  # 提取前一根与当前实时 RSI2
-  prev_rsi2 = float(prev["RSI2"]) if "RSI2" in prev else None
-  curr_rsi2 = float(latest["RSI2"]) if "RSI2" in latest else None
+    # 提取前一根与当前实时 RSI2
+    prev_rsi2 = float(prev["RSI2"]) if "RSI2" in prev else None
+    curr_rsi2 = float(latest["RSI2"]) if "RSI2" in latest else None
 
-  # --- 校验 1: RSI2 数据完整性 ---
-  if (
-      prev_rsi2 is None
-      or pd.isna(prev_rsi2)
-      or curr_rsi2 is None
-      or pd.isna(curr_rsi2)
-  ):
-    print(
-        f"[M15-RSI] ❌ 失败: RSI2 数据缺失 (前1: {prev_rsi2}, 实时:"
-        f" {curr_rsi2})"
-    )
-    return None
+    # --- 校验 1: RSI2 数据完整性 ---
+    if (
+        prev_rsi2 is None
+        or pd.isna(prev_rsi2)
+        or curr_rsi2 is None
+        or pd.isna(curr_rsi2)
+    ):
+        print(
+            f"[M15-RSI] ❌ 失败: RSI2 数据缺失 (前1: {prev_rsi2}, 实时: {curr_rsi2})"
+        )
+        return None
 
-  # --- 校验 2: ADX 震荡硬过滤 ---
-  adx14 = (
-      float(latest["ADX14"])
-      if "ADX14" in latest and not pd.isna(latest["ADX14"])
-      else (
-          float(latest["ADX"])
-          if "ADX" in latest and not pd.isna(latest["ADX"])
-          else None
-      )
-  )
-
-  if adx14 is not None and adx14 >= 25:
-    print(
-        f"[M15-RSI] ❌ 过滤: M15 处于趋势行情 (ADX={adx14:.1f} >= 25,"
-        " 排除震荡策略)"
-    )
-    return None
-
-  # --- 校验 3: M5 形态确认 ---
-  is_m5_bullish = None
-  is_m5_bearish = None
-
-  if df_m5 is not None and len(df_m5) >= 2:
-    m5_time_col = (
-        "t"
-        if "t" in df_m5.columns
-        else ("Time" if "Time" in df_m5.columns else None)
-    )
-    if m5_time_col:
-      df_m5[m5_time_col] = pd.to_datetime(df_m5[m5_time_col])
-      df_m5 = df_m5.sort_values(m5_time_col, ascending=True).reset_index(
-          drop=True
-      )
-
-    last_closed_m5 = df_m5.iloc[-2]
-    m5_time = (
-        last_closed_m5[m5_time_col] if m5_time_col else "未提供时间戳"
-    )
-    m5_open = float(last_closed_m5["Open"])
-    m5_high = float(last_closed_m5["High"])
-    m5_low = float(last_closed_m5["Low"])
-    m5_close = float(last_closed_m5["Close"])
-
-    m5_body = abs(m5_close - m5_open)
-    m5_total = m5_high - m5_low
-
-    has_strong_body = m5_total > 0 and m5_body >= 0.2 * m5_total
-    is_m5_bullish = (m5_close > m5_open) and has_strong_body
-    is_m5_bearish = (m5_close < m5_open) and has_strong_body
-
-    print(
-        f"[M5校验] 时间: {m5_time} | Open: {m5_open:.2f} | Close:"
-        f" {m5_close:.2f} | 实体: {m5_body:.2f}/{m5_total:.2f} | 强阳止跌:"
-        f" {is_m5_bullish} | 强阴见顶: {is_m5_bearish}"
+    # --- 校验 2: ADX 震荡硬过滤 ---
+    adx14 = (
+        float(latest["ADX14"])
+        if "ADX14" in latest and not pd.isna(latest["ADX14"])
+        else (
+            float(latest["ADX"])
+            if "ADX" in latest and not pd.isna(latest["ADX"])
+            else None
+        )
     )
 
-  elif df_m5 is None:
-    print("[M15-RSI] ⚠️ 警告: 未传入 M5 数据 (df_m5 is None)，无法校验止跌/见顶")
-  elif len(df_m5) < 2:
-    print(
-        f"[M15-RSI] ❌ 失败: M5 数据量不足 (当前: {len(df_m5)} 行, 需要 >= 2)"
-    )
-    return None
+    if adx14 is not None and adx14 >= 25:
+        print(
+            f"[M15-RSI] ❌ 过滤: M15 处于趋势行情 (ADX={adx14:.1f} >= 25, 排除震荡策略)"
+        )
+        return None
 
-  # --- 校验 4: 触发条件判断 ---
-  is_rsi_oversold = (prev_rsi2 < 15) or (curr_rsi2 < 15)
-  is_rsi_overbought = (prev_rsi2 > 85) or (curr_rsi2 > 85)
+    # --- 校验 3: M5 形态确认 ---
+    is_m5_bullish = None
+    is_m5_bearish = None
 
-  # 4.1 做多判断
-  if is_rsi_oversold:
-    if is_m5_bullish:
-      atr_val = latest.get("ATR", float("nan"))
-      sl = (
-          _calc_atr_stop(df)
-          if not pd.isna(atr_val) and "_calc_atr_stop" in globals()
-          else (float(atr_val * 1) if not pd.isna(atr_val) else 8.0)
-      )
-      sl = min(max(sl, 6.0), 12.0)
+    if df_m5 is not None and len(df_m5) >= 2:
+        m5_time_col = (
+            "t"
+            if "t" in df_m5.columns
+            else ("Time" if "Time" in df_m5.columns else None)
+        )
+        if m5_time_col:
+            df_m5[m5_time_col] = pd.to_datetime(df_m5[m5_time_col])
+            df_m5 = df_m5.sort_values(m5_time_col, ascending=True).reset_index(
+                drop=True
+            )
 
-      print(
-          f"🚀 [M15-RSI] ✅ 触发做多信号! RSI2(前1={prev_rsi2:.1f},"
-          f" 实时={curr_rsi2:.1f}), M5强阳"
-      )
-      return {
-          "strategy": "m15_rsi",
-          "signal": "BUY",
-          "reason": (
-              f"M15 RSI做多: RSI(2)(前1={prev_rsi2:.1f}, 实时={curr_rsi2:.1f}"
-              f" < 15), M5强阳止跌 (ADX={adx14:.1f})"
-          ),
-          "close": close,
-          "sl": sl,
-          "tp": 0,
-      }
+        last_closed_m5 = df_m5.iloc[-2]
+        m5_time = (
+            last_closed_m5[m5_time_col] if m5_time_col else "未提供时间戳"
+        )
+        m5_open = float(last_closed_m5["Open"])
+        m5_high = float(last_closed_m5["High"])
+        m5_low = float(last_closed_m5["Low"])
+        m5_close = float(last_closed_m5["Close"])
+
+        m5_body = abs(m5_close - m5_open)
+        m5_total = m5_high - m5_low
+
+        has_strong_body = m5_total > 0 and m5_body >= 0.2 * m5_total
+        is_m5_bullish = (m5_close > m5_open) and has_strong_body
+        is_m5_bearish = (m5_close < m5_open) and has_strong_body
+
+        print(
+            f"[M5校验] 时间: {m5_time} | Open: {m5_open:.2f} | Close: {m5_close:.2f} | "
+            f"实体: {m5_body:.2f}/{m5_total:.2f} | 强阳止跌: {is_m5_bullish} | 强阴见顶: {is_m5_bearish}"
+        )
+
+    elif df_m5 is None:
+        # M5 数据缺失 → is_m5_bullish/is_m5_bearish 保持 None → 永远不会开仓。
+        # 必须写进日志, 否则 M15 RSI 会"静默死亡"(只print在控制台, 不落 gold_runner.log)。
+        log.warning(
+            "  ⚠️ [M15-RSI] 缺少 M5 数据 (bars_m5.json 不存在/yfinance失败)，"
+            "无法做止跌·见顶校验 → 本策略无法开仓! 请检查EA是否在写 bars_m5.json"
+        )
+        print("[M15-RSI] ⚠️ 警告: 未传入 M5 数据 (df_m5 is None)，无法校验止跌/见顶")
+    elif len(df_m5) < 2:
+        print(
+            f"[M15-RSI] ❌ 失败: M5 数据量不足 (当前: {len(df_m5)} 行, 需要 >= 2)"
+        )
+        return None
+
+    # ADX 可能是 None (数据不足/全平时 ADX 会算成 NaN), 不能直接拿去格式化,
+    # 否则这里会抛 TypeError, 把整个扫描周期(所有策略)一起打断。
+    adx_txt = f"{adx14:.1f}" if adx14 is not None else "N/A"
+
+    # --- 校验 4: 触发条件判断 ---
+    is_rsi_oversold = (prev_rsi2 < 15) or (curr_rsi2 < 15)
+    is_rsi_overbought = (prev_rsi2 > 85) or (curr_rsi2 > 85)
+
+    # --- 校验 5: 趋势对齐过滤 ---
+    # 旧版(远端 8846c92)原本有这条: 做多要求 价格>SMA50, 做空要求 价格<SMA50,
+    # 即"只在SMA50的顺势一侧做均值回归"。本地重写时把它丢掉了。
+    # 回测(research/ab_remote_vs_local.py, 2024-01→2025-01)显示这正是关键差异:
+    #   无对齐: 1181笔 净 -$488 (其中空头 -$706, 牛市里逆势抄顶被打爆)
+    #   有对齐:  434笔 净   -$5 (其中空头  -$92)
+    if getattr(config, 'M15_RSI_TREND_FILTER', True):
+        try:
+            _sma50 = float(latest["SMA50"])
+        except Exception:
+            _sma50 = float('nan')
+        if not pd.isna(_sma50):
+            if is_rsi_oversold and close < _sma50:
+                return None      # 超卖但价在SMA50下方 = 下跌趋势里接刀, 放弃
+            if is_rsi_overbought and close > _sma50:
+                return None      # 超买但价在SMA50上方 = 上涨趋势里摸顶, 放弃
+
+    current_time = time.time()
+    # 同方向两次开仓的最小间隔。原来硬编码 1200 秒(20分钟)。
+    # 回测(research/backtest_m15rsi.py, 2024-01→2025-01)显示: 该策略毛利为正,
+    # 但一年约1300笔 × 点差$0.46 ≈ $600 的成本会把毛利全部吃掉。
+    # 把间隔放宽到180分钟后, 净亏损从 -$300 收敛到约 -$6 (基本打平)。
+    cooldown_seconds = int(getattr(config, 'M15_RSI_COOLDOWN_MINUTES', 20)) * 60
+
+    # 4.1 做多判断
+    if is_rsi_oversold:
+        if is_m5_bullish:
+            # --- 10分钟防重复开多单检查 ---
+            if current_time - _LAST_BUY_TIME < cooldown_seconds:
+                remaining_sec = int(cooldown_seconds - (current_time - _LAST_BUY_TIME))
+                print(
+                    f"[M15-RSI] ⏳ 冷却中: {cooldown_seconds//60}分钟内已开过多单，还需等待 {remaining_sec} 秒"
+                )
+                return None
+
+            sl = _calc_m15_rsi_stop(df)
+
+            # 更新做多开仓时间戳
+            _LAST_BUY_TIME = current_time
+
+            log.info(
+                f"🚀 [M15-RSI] ✅ 触发做多信号! RSI2(前1={prev_rsi2:.1f},"
+                f" 实时={curr_rsi2:.1f}), M5强阳, SL=${sl:.2f}"
+            )
+            return {
+                "strategy": "m15_rsi",
+                "signal": "BUY",
+                "reason": (
+                    f"M15 RSI做多: RSI(2)(前1={prev_rsi2:.1f}, 实时={curr_rsi2:.1f}"
+                    f" < 15), M5强阳止跌 (ADX={adx_txt})"
+                ),
+                "close": close,
+                "sl": sl,
+                "tp": 0,
+            }
+        else:
+            print(
+                f"[M15-RSI] ⏳ 未触发做多: M15 RSI2 已超卖 (前1={prev_rsi2:.1f},"
+                f" 实时={curr_rsi2:.1f} < 15)，但 M5 未出现强实体阳线止跌"
+            )
+
+    # 4.2 做空判断
+    elif is_rsi_overbought:
+        if is_m5_bearish:
+            # --- 10分钟防重复开空单检查 ---
+            if current_time - _LAST_SELL_TIME < cooldown_seconds:
+                remaining_sec = int(cooldown_seconds - (current_time - _LAST_SELL_TIME))
+                print(
+                    f"[M15-RSI] ⏳ 冷却中: {cooldown_seconds//60}分钟内已开过空单，还需等待 {remaining_sec} 秒"
+                )
+                return None
+
+            sl = _calc_m15_rsi_stop(df)
+
+            # 更新做空开仓时间戳
+            _LAST_SELL_TIME = current_time
+
+            log.info(
+                f"🚀 [M15-RSI] ✅ 触发做空信号! RSI2(前1={prev_rsi2:.1f},"
+                f" 实时={curr_rsi2:.1f}), M5强阴, SL=${sl:.2f}"
+            )
+            return {
+                "strategy": "m15_rsi",
+                "signal": "SELL",
+                "reason": (
+                    f"M15 RSI做空: RSI(2)(前1={prev_rsi2:.1f}, 实时={curr_rsi2:.1f}"
+                    f" > 85), M5强阴见顶 (ADX={adx_txt})"
+                ),
+                "close": close,
+                "sl": sl,
+                "tp": 0,
+            }
+        else:
+            print(
+                f"[M15-RSI] ⏳ 未触发做空: M15 RSI2 已超买 (前1={prev_rsi2:.1f},"
+                f" 实时={curr_rsi2:.1f} > 85)，但 M5 未出现强实体阴线见顶"
+            )
+
     else:
-      print(
-          f"[M15-RSI] ⏳ 未触发做多: M15 RSI2 已超卖 (前1={prev_rsi2:.1f},"
-          f" 实时={curr_rsi2:.1f} < 15)，但 M5 未出现强实体阳线止跌"
-      )
+        # 既不超买也不超卖时的常规汇报
+        print(
+            f"[M15-RSI] ⚪ 无信号: RSI2(前1={prev_rsi2:.1f},"
+            f" 实时={curr_rsi2:.1f}) 处于常态区间 [15 ~ 85]"
+        )
 
-  # 4.2 做空判断
-  elif is_rsi_overbought:
-    if is_m5_bearish:
-      atr_val = latest.get("ATR", float("nan"))
-      sl = (
-          _calc_atr_stop(df)
-          if not pd.isna(atr_val) and "_calc_atr_stop" in globals()
-          else (float(atr_val * 1) if not pd.isna(atr_val) else 8.0)
-      )
-      sl = min(max(sl, 6.0), 12.0)
-
-      print(
-          f"🚀 [M15-RSI] ✅ 触发做空信号! RSI2(前1={prev_rsi2:.1f},"
-          f" 实时={curr_rsi2:.1f}), M5强阴"
-      )
-      return {
-          "strategy": "m15_rsi",
-          "signal": "SELL",
-          "reason": (
-              f"M15 RSI做空: RSI(2)(前1={prev_rsi2:.1f}, 实时={curr_rsi2:.1f}"
-              f" > 85), M5强阴见顶 (ADX={adx14:.1f})"
-          ),
-          "close": close,
-          "sl": sl,
-          "tp": 0,
-      }
-    else:
-      print(
-          f"[M15-RSI] ⏳ 未触发做空: M15 RSI2 已超买 (前1={prev_rsi2:.1f},"
-          f" 实时={curr_rsi2:.1f} > 85)，但 M5 未出现强实体阴线见顶"
-      )
-
-  else:
-    # 既不超买也不超卖时的常规汇报
-    print(
-        f"[M15-RSI] ⚪ 无信号: RSI2(前1={prev_rsi2:.1f},"
-        f" 实时={curr_rsi2:.1f}) 处于常态区间 [15 ~ 85]"
-    )
-
-  return None
-
+    return None
 # ═══════════════════════════════════════════════════════════════
 # NY开盘区间突破 (ORB) 策略
 # ═══════════════════════════════════════════════════════════════
@@ -718,11 +805,10 @@ class ORBStrategy:
         用H1数据检测ORB信号
 
         逻辑:
-        1. 识别NY开盘K线 (UTC 14:xx) → 设定区间
+        1. 识别NY开盘K线 (UTC 14:xx, 经 MT4_SERVER_UTC_OFFSET_HOURS 换算) → 设定区间
         2. 后续的K线检查是否突破
         """
-        if not _cfg.ORB_ENABLED:
-            return None
+
         if len(df) < 10:
             return None
 
@@ -731,13 +817,7 @@ class ORBStrategy:
         high = float(latest['High'])
         low = float(latest['Low'])
 
-        # 获取当前K线的UTC小时
         bar_time = df.index[-1]
-        if hasattr(bar_time, 'hour'):
-            bar_hour = bar_time.hour
-        else:
-            bar_hour = -1
-
         today = bar_time.date() if hasattr(bar_time, 'date') else None
 
         # 新的一天重置
@@ -751,7 +831,11 @@ class ORBStrategy:
                 idx = -(lookback + 1)
                 check_bar = df.iloc[idx]
                 check_time = df.index[idx]
-                check_hour = check_time.hour if hasattr(check_time, 'hour') else -1
+                # K线时间戳来自MT4 = 经纪商服务器时间, 需换算成UTC再和 ORB_NY_OPEN_HOUR_UTC 比较
+                check_hour = (
+                    (check_time.hour - getattr(_cfg, 'MT4_SERVER_UTC_OFFSET_HOURS', 0)) % 24
+                    if hasattr(check_time, 'hour') else -1
+                )
                 check_date = check_time.date() if hasattr(check_time, 'date') else None
                 
                 if check_hour == _cfg.ORB_NY_OPEN_HOUR_UTC:
@@ -768,11 +852,10 @@ class ORBStrategy:
                     log.info(f"  [🇺🇸 ORB] NY开盘区间设定: [{self.range_low:.2f} - {self.range_high:.2f}] "
                              f"宽度=${range_width:.2f} 窗口{self.window_expiry}根K线")
                     
-                    # 如果是回溯找到的，当前K线已经是后续K线，直接检查突破
+                    # 如果是回溯找到的, 当前K线可能已经在突破 → 继续走Step 2检查
                     if lookback > 0:
-                        break  # 跳出循环，下面Step 2会检查突破
+                        break
                     return None  # 开盘K线本身不交易
-                    break
 
         # Step 2: 检查突破
         if self.window_open and self.range_high is not None and not self.traded_today:
@@ -792,33 +875,47 @@ class ORBStrategy:
                 self.window_open = False
                 return None
 
-            sl = round(range_width * _cfg.ORB_SL_MULTIPLIER, 2)
-            tp = round(range_width * _cfg.ORB_TP_MULTIPLIER, 2)
-
             # 突破上沿 → 做多
             if high > self.range_high:
                 self.traded_today = True
                 self.window_open = False
+                # 结构位口径: 止损放到开盘区间【下沿】外侧, 止盈取区间宽度(等幅目标)
+                lv = calc_dynamic_levels(
+                    df, direction='BUY', entry=close,
+                    structural_stop_dist=max(0.01, close - self.range_low),
+                    structural_target_dist=range_width,
+                )
                 return {
                     'strategy': 'orb',
                     'signal': 'BUY',
-                    'reason': f"🇺🇸 ORB做多: 价格{high:.2f} 突破开盘区间上沿{self.range_high:.2f} (区间${range_width:.1f})",
+                    'reason': f"🇺🇸 ORB做多: 价格{high:.2f} 突破开盘区间上沿{self.range_high:.2f} (区间${range_width:.1f}) | {lv['reason']}",
                     'close': close,
-                    'sl': sl,
-                    'tp': tp,
+                    'sl': lv['sl'],
+                    'tp': lv['tp'],
+                    'atr': lv['atr'],
+                    'regime': lv['regime'],
+                    'bar_time': df.index[-1],
                 }
 
             # 跌破下沿 → 做空
             if low < self.range_low:
                 self.traded_today = True
                 self.window_open = False
+                lv = calc_dynamic_levels(
+                    df, direction='SELL', entry=close,
+                    structural_stop_dist=max(0.01, self.range_high - close),
+                    structural_target_dist=range_width,
+                )
                 return {
                     'strategy': 'orb',
                     'signal': 'SELL',
-                    'reason': f"🇺🇸 ORB做空: 价格{low:.2f} 跌破开盘区间下沿{self.range_low:.2f} (区间${range_width:.1f})",
+                    'reason': f"🇺🇸 ORB做空: 价格{low:.2f} 跌破开盘区间下沿{self.range_low:.2f} (区间${range_width:.1f}) | {lv['reason']}",
                     'close': close,
-                    'sl': sl,
-                    'tp': tp,
+                    'sl': lv['sl'],
+                    'tp': lv['tp'],
+                    'atr': lv['atr'],
+                    'regime': lv['regime'],
+                    'bar_time': df.index[-1],
                 }
 
         return None
@@ -881,26 +978,92 @@ def calc_auto_lot_size(atr: float, sl_distance: float) -> float:
 # 信号扫描入口
 # ═══════════════════════════════════════════════════════════════
 
-def scan_all_signals(df: pd.DataFrame, timeframe: str = 'H1', df_m5: Optional[pd.DataFrame] = None) -> List[Dict]:
-    """扫描所有已启用策略的信号"""
-    import config as _scan_cfg
+def is_strategy_enabled(name: str) -> bool:
+    """
+    读取策略开关 — 唯一真值来源 config.STRATEGIES[name]['enabled']
+
+    历史bug (本次修复):
+      1. check_keltner_signal() 被无条件调用, 完全没看 STRATEGIES['keltner']['enabled'],
+         所以 config 里把 keltner 设为 False 之后仍然继续开单。
+      2. ORB 读的是 config.ORB_ENABLED (另一个独立开关, 一直是 True),
+         而不是 STRATEGIES['orb']['enabled'], 所以设为 False 也无效。
+      3. M15 RSI 没有任何开关, 永远执行。
+    现在所有策略统一走这个函数, 并且缺少配置项时一律视为"未启用"。
+    """
+    import config as _cfg
+    entry = _cfg.STRATEGIES.get(name)
+    if not isinstance(entry, dict):
+        log.warning(
+            f"  ⚠️ 策略 '{name}' 在 config.STRATEGIES 中没有配置项，按【未启用】处理"
+        )
+        return False
+    return bool(entry.get('enabled', False))
+
+
+def get_enabled_strategies() -> List[str]:
+    """返回当前已启用的策略名列表 (用于启动日志自检)"""
+    import config as _cfg
+    return [
+        name for name, entry in _cfg.STRATEGIES.items()
+        if isinstance(entry, dict) and entry.get('enabled', False)
+    ]
+
+
+# 策略名 → 检测函数 (只在启用的前提下才会被调用)
+_H1_CHECKERS = (
+    ('keltner', check_keltner_signal),
+    ('macd', check_macd_signal),
+)
+
+# 真正接入了 scan_all_signals() 的策略名清单。
+# 新增策略时必须同步这个元组, 否则 get_unwired_strategies() 会在启动时报警 —
+# 防止出现"config里enabled=True但代码根本没调用"的反向bug
+# (M15 RSI 就曾经因为 STRATEGIES 里没有 m15_rsi 条目而一直不交易)。
+WIRED_STRATEGIES = ('keltner', 'macd', 'orb', 'm15_rsi')
+
+
+def get_unwired_strategies() -> List[str]:
+    """返回 config 中已启用、但代码里没有对应检测函数的策略名 (应报警)"""
+    import config as _cfg
+    return [
+        name for name, entry in _cfg.STRATEGIES.items()
+        if isinstance(entry, dict)
+        and entry.get('enabled', False)
+        and name not in WIRED_STRATEGIES
+    ]
+
+
+def scan_all_signals(df, timeframe='H1', df_m5=None):
+    """
+    扫描所有【已启用】策略的信号
+
+    每个策略都必须经过 is_strategy_enabled() 判断, 不允许出现无条件调用。
+    """
     signals = []
+
     if timeframe == 'H1':
-        sig = check_keltner_signal(df)
-        if sig:
-            signals.append(sig)
-        if _scan_cfg.STRATEGIES.get('macd', {}).get('enabled', True):
-            sig = check_macd_signal(df)
+        for name, checker in _H1_CHECKERS:
+            if not is_strategy_enabled(name):
+                log.debug(f"    ⏭️ {name} 已在 config 中禁用，跳过检测")
+                continue
+            sig = checker(df)
             if sig:
                 signals.append(sig)
-        # ORB策略 (也用H1数据)
-        if _scan_cfg.ORB_ENABLED:
+
+        # ORB 也用 H1 数据, 开关同样只看 STRATEGIES['orb']['enabled']
+        if is_strategy_enabled('orb'):
             sig = check_orb_signal(df)
             if sig:
                 signals.append(sig)
+        else:
+            log.debug("    ⏭️ orb 已在 config 中禁用，跳过检测")
+
     elif timeframe in ('M5', 'M15'):
-        # 修正：将 df_m5 正确传递给 check_m15_rsi_signal
-        sig = check_m15_rsi_signal(df, df_m5=df_m5)
-        if sig:
-            signals.append(sig)
+        if is_strategy_enabled('m15_rsi'):
+            sig = check_m15_rsi_signal(df, df_m5=df_m5)
+            if sig:
+                signals.append(sig)
+        else:
+            log.debug("    ⏭️ m15_rsi 已在 config 中禁用，跳过检测")
+
     return signals

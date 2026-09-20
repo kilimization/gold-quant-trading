@@ -12,12 +12,26 @@
 """
 
 from datetime import datetime
-import logging
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-logging.getLogger("telegram").setLevel(logging.WARNING)
-logging.getLogger("telegram.ext").setLevel(logging.WARNING)
 from pathlib import Path
+import logging
+# --- 方法：筛选并屏蔽 httpx / httpcore 模块的报错 ---
+class SuppressHTTPXErrorsFilter(logging.Filter):
+
+  def filter(self, record):
+    # 如果日志来自 httpx 或 httpcore，直接屏蔽（返回 False）
+    if record.name and (
+        record.name.startswith("httpx") or record.name.startswith("httpcore")
+    ):
+      return False
+    return True
+
+
+# 挂载到根 Logger 或特定的 Logger
+logging.getLogger().addFilter(SuppressHTTPXErrorsFilter())
+
+# 另外，将第三方库的日志级别提高到 CRITICAL，减少无用输出
+logging.getLogger("httpx").setLevel(logging.CRITICAL)
+logging.getLogger("httpcore").setLevel(logging.CRITICAL)
 import sys
 import time
 from zoneinfo import ZoneInfo
@@ -26,6 +40,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import config
 from gold_trader import GoldTrader
+from strategies.signals import get_enabled_strategies, get_unwired_strategies
+from strategies.risk import check_risk_config, breakeven_winrate
 import notifier
 
 # ============================================================
@@ -207,8 +223,40 @@ def main():
       f"   本金: ${config.CAPITAL}  止损上限: ${config.MAX_TOTAL_LOSS}"
   )
   log.info(f"   扫描频率: 每{config.SCAN_INTERVAL_SECONDS}秒")
+
+  # 启动自检: 打印真正生效的策略开关 (避免"以为关了其实没关")
+  enabled = get_enabled_strategies()
+  disabled = [n for n, e in config.STRATEGIES.items()
+              if not (isinstance(e, dict) and e.get("enabled", False))]
+  if enabled:
+    log.info("   已启用策略: " + ", ".join(
+        f"{n}({config.STRATEGIES[n].get('name', n)})" for n in enabled))
+  else:
+    log.warning("   🛑 没有任何策略被启用 — 系统不会开任何新仓! 请检查 config.STRATEGIES")
+  if disabled:
+    log.info("   已禁用策略: " + ", ".join(disabled))
+
+  unwired = get_unwired_strategies()
+  if unwired:
+    log.warning(
+      f"   ⚠️ 这些策略在 config 里是 enabled=True, 但代码里没有接入检测函数, "
+      f"实际永远不会开仓: {', '.join(unwired)}"
+    )
+
+  # 止损止盈/移动止损参数自检 —— 参数自相矛盾时"动态止损"会变成死代码
+  risk_problems = check_risk_config()
+  if risk_problems:
+    for p in risk_problems:
+      log.warning(f"   ⚠️ [风控参数] {p}")
   log.info(
-      "   策略: H1 Keltner(状态机)+MACD+ORB(NY开盘突破) + M15 RSI"
+    f"   止盈止损: 结构位(前{config.DYN_STRUCT_LOOKBACK}根已收盘K线高低点)"
+    f"+ATR缓冲{config.DYN_STRUCT_BUFFER_ATR}×ATR | "
+    f"ATR兜底 SL{config.DYN_SL_ATR_MULTIPLIER}×/TP{config.DYN_TP_ATR_MULTIPLIER}×"
+  )
+  log.info(
+    f"   保本{config.BREAKEVEN_TRIGGER_ATR}×ATR → 跟踪{config.TRAIL_START_ATR}×ATR"
+    f"(距离{config.TRAIL_DISTANCE_ATR}×ATR) | "
+    f"ATR兜底口径约需胜率>{breakeven_winrate()*100:.0f}% (结构口径下每个信号不同)"
   )
 
   # 1. 实例化交易对象
@@ -310,7 +358,7 @@ def main():
         log.error(f"出场检查出错: {e}")
 
       # 每5分钟做一次完整信号扫描 (M15策略需要, 每10次循环×30秒≈5分钟)
-      if scan_count == 1 or scan_count % 10 == 0:
+      if scan_count == 1 or scan_count % 2 == 0:
         log.info(f"\n📊 完整信号扫描 (#{scan_count})")
         try:
           result = trader.scan_and_trade()

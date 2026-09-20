@@ -29,6 +29,9 @@ logging.getLogger("telegram.ext._utils.networkloop").setLevel(logging.CRITICAL)
 _tg_app: Optional[Application] = None
 _status_provider: Optional[Callable[[], dict]] = None
 _control_handler: Optional[Callable[[str], tuple[bool, str]]] = None
+_bot_loop: Optional[asyncio.AbstractEventLoop] = None  # Bot 轮询线程真正运行的事件循环
+_tg_thread: Optional[threading.Thread] = None         # 轮询线程 (全局只允许启动一次)
+_tg_thread_started = False                            # 轮询线程启动保护标志 (防止重复起轮询器)
 
 # 1. 增加异常拦截函数
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -167,26 +170,25 @@ async def _cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
   if not _auth_check(update):
     return
 
-  if _control_handler is not None:
+  if _control_handler is None:
+    # 原 globals()["trader"] 兜底分支在 notifier 中永远不存在，属死代码，已移除
+    await update.message.reply_text("❌ 交易对象未初始化，无法暂停。")
+    return
+
+  try:
     success, msg = _control_handler("pause")
-    if success:
-      await update.message.reply_html(
-          f"⏸️ <b>交易系统已暂停交易！</b>\n\n{msg}\n<i>系统将继续监控市场，但<b>不会开立任何新仓位</b>。</i>"
-      )
-    else:
-      await update.message.reply_text(f"❌ 暂停失败: {msg}")
-  elif "trader" in globals() and globals()["trader"] is not None:
-    trader = globals()["trader"]
-    if hasattr(trader, "pause_trading"):
-      trader.pause_trading()
-    else:
-      trader.is_paused = True
+  except Exception as e:
+    log.exception(f"执行 /pause 控制回调异常: {e}")
+    await update.message.reply_text(f"❌ 暂停失败: 控制回调异常 ({e})")
+    return
+
+  if success:
     await update.message.reply_html(
-        "⏸️ <b>交易系统已暂停交易！</b>\n\n系统将继续监控市场，但<b>不会开立任何新仓位</b>。"
+        f"⏸️ <b>交易系统已暂停交易！</b>\n\n{msg}\n<i>系统将继续监控市场，但<b>不会开立任何新仓位</b>。</i>"
     )
     log.info("收到 Telegram 指令：系统交易已暂停。")
   else:
-    await update.message.reply_text("❌ 交易对象未初始化，无法暂停。")
+    await update.message.reply_text(f"❌ 暂停失败: {msg}")
 
 
 async def _cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -194,26 +196,25 @@ async def _cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
   if not _auth_check(update):
     return
 
-  if _control_handler is not None:
+  if _control_handler is None:
+    # 原 globals()["trader"] 兜底分支在 notifier 中永远不存在，属死代码，已移除
+    await update.message.reply_text("❌ 交易对象未初始化，无法恢复。")
+    return
+
+  try:
     success, msg = _control_handler("resume")
-    if success:
-      await update.message.reply_html(
-          f"▶️ <b>交易系统已恢复交易！</b>\n\n{msg}\n<i>系统已重新开启自动下单功能。</i>"
-      )
-    else:
-      await update.message.reply_text(f"❌ 恢复失败: {msg}")
-  elif "trader" in globals() and globals()["trader"] is not None:
-    trader = globals()["trader"]
-    if hasattr(trader, "resume_trading"):
-      trader.resume_trading()
-    else:
-      trader.is_paused = False
+  except Exception as e:
+    log.exception(f"执行 /resume 控制回调异常: {e}")
+    await update.message.reply_text(f"❌ 恢复失败: 控制回调异常 ({e})")
+    return
+
+  if success:
     await update.message.reply_html(
-        "▶️ <b>交易系统已恢复交易！</b>\n\n系统已重新开启自动下单功能。"
+        f"▶️ <b>交易系统已恢复交易！</b>\n\n{msg}\n<i>系统已重新开启自动下单功能。</i>"
     )
     log.info("收到 Telegram 指令：系统交易已恢复。")
   else:
-    await update.message.reply_text("❌ 交易对象未初始化，无法恢复。")
+    await update.message.reply_text(f"❌ 恢复失败: {msg}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -231,126 +232,188 @@ def init_telegram_bot(
   :param status_provider_func: 获取实时状态的回调函数
   :param control_handler_func: 可选，处理 pause/resume 等控制命令的回调函数
   """
-# 1. 从 config 获取 Token
-  token = getattr(config, "TELEGRAM_BOT_TOKEN", None)
-  proxy_url = getattr(config, "TELEGRAM_PROXY", "http://127.0.0.1:7899")  # 替换为你的代理端口
-
-  builder = ApplicationBuilder().token(token)
-
-    # 💡 使用 HTTPXRequest 设置代理
-  if proxy_url:
-        request = HTTPXRequest(
-            proxy=proxy_url,
-            connect_timeout=10.0,
-            read_timeout=10.0
-        )
-        builder.request(request)
-        builder.get_updates_request(request)
-
-  app = builder.build()
-  app.add_error_handler(error_handler)
-  
   global _tg_app, _status_provider, _control_handler
-  if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
-    log.warning("Telegram Bot Token 或 Chat ID 未配置，跳过 Telegram Bot 初始化。")
-    return
+  global _tg_thread, _tg_thread_started
 
-  _status_provider = status_provider_func
-  _control_handler = control_handler_func
+  try:
+    # 1. 先校验 Token / Chat ID —— 必须放在 build() 之前。
+    #    空 token 时 build() 会抛 InvalidToken，旧代码的"跳过"分支因此永远走不到。
+    token = getattr(config, "TELEGRAM_BOT_TOKEN", None)
+    chat_id = getattr(config, "TELEGRAM_CHAT_ID", None)
+    if not token or not chat_id:
+      log.warning("Telegram Bot Token 或 Chat ID 未配置，跳过 Telegram Bot 初始化。")
+      return
+
+    # 回调登记 (保持全局状态可查)
+    _status_provider = status_provider_func
+    _control_handler = control_handler_func
+
+    notify_method = str(getattr(config, "NOTIFY_METHOD", "telegram")).lower()
+    if notify_method != "telegram":
+      log.info(f"NOTIFY_METHOD={notify_method}，跳过 Telegram 轮询，通知走 console 输出。")
+      return
+
+    if _tg_thread_started:
+      log.info("Telegram 轮询线程已启动，忽略重复初始化。")
+      return
+
+    proxy_url = getattr(config, "TELEGRAM_PROXY", "http://127.0.0.1:7899")
+
+    # 2. 只构建一个 Application：代理 + 指令路由 + 错误处理器全部注册在它上面，
+    #    轮询线程 (_run_bot) 轮询的就是这一个实例，不再重复 build。
+    builder = ApplicationBuilder().token(token)
+    if proxy_url:
+      request = HTTPXRequest(
+          proxy=proxy_url,
+          connect_timeout=10.0,
+          read_timeout=10.0,
+      )
+      builder.request(request)
+      builder.get_updates_request(request)
+    builder.post_init(_capture_bot_loop)
+
+    app = builder.build()
+    app.add_handler(CommandHandler("start", _cmd_start))
+    app.add_handler(CommandHandler("help", _cmd_start))
+    app.add_handler(CommandHandler("status", _cmd_status))
+    app.add_handler(CommandHandler("report", _cmd_report))
+    app.add_handler(CommandHandler("pause", _cmd_pause))
+    app.add_handler(CommandHandler("resume", _cmd_resume))
+    app.add_error_handler(error_handler)
+    _tg_app = app
+
+    # 3. 轮询线程只在这里启动一次 (模块导入时不再启动任何网络线程)
+    _tg_thread_started = True
+    _tg_thread = threading.Thread(
+        target=_run_bot, daemon=True, name="TelegramBotThread"
+    )
+    _tg_thread.start()
+    log.info("Telegram 交互与控制服务线程已启动。")
+  except Exception as e:
+    log.error(f"初始化 Telegram Bot 失败 (交易主流程不受影响): {e}")
+
+
+async def _capture_bot_loop(application: Application) -> None:
+  """post_init 回调：记录真正运行 Bot 的事件循环，供 send_telegram 跨线程投递"""
+  global _bot_loop
+  try:
+    _bot_loop = asyncio.get_running_loop()
+  except Exception as e:
+    log.warning(f"记录 Telegram 事件循环失败: {e}")
+
 
 def _run_bot():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+  """在独立线程中轮询 init_telegram_bot 构建好的那一个 Application"""
+  global _bot_loop
 
-    global _tg_app
+  app = _tg_app
+  if app is None:
+    log.error("Telegram Application 未构建，轮询线程退出。")
+    return
 
-    # 1. 配置代理与超时 (优先读取 config 中的代理，默9 端口)
-    proxy_url = getattr(config, "TELEGRAM_PROXY", "http://127.0.0.1:7899")
-    request_kwargs = {"connect_timeout": 15.0, "read_timeout": 15.0}
-    
-    if proxy_url:
-        request_kwargs["proxy"] = proxy_url
+  proxy_url = getattr(config, "TELEGRAM_PROXY", "http://127.0.0.1:7899")
+  loop = asyncio.new_event_loop()
+  asyncio.set_event_loop(loop)
 
-    request = HTTPXRequest(**request_kwargs)
-
-    # 2. 构建 Application 并绑定 request
-    _tg_app = (
-        Application.builder()
-        .token(config.TELEGRAM_BOT_TOKEN)
-        .request(request)
-        .get_updates_request(request)
-        .build()
+  # 捕获连接异常，避免刷屏
+  try:
+    log.info("Telegram 交互与控制服务启动中...")
+    app.run_polling(
+        drop_pending_updates=True,
+        stop_signals=None,
+        bootstrap_retries=3,  # 尝试连接3次
     )
-
-    # 3. 注册指令路由
-    _tg_app.add_handler(CommandHandler("start", _cmd_start))
-    _tg_app.add_handler(CommandHandler("help", _cmd_start))
-    _tg_app.add_handler(CommandHandler("status", _cmd_status))
-    _tg_app.add_handler(CommandHandler("report", _cmd_report))
-    _tg_app.add_handler(CommandHandler("pause", _cmd_pause))
-    _tg_app.add_handler(CommandHandler("resume", _cmd_resume))
-
-    # 4. 捕获连接异常，避免刷屏
+  except (NetworkError, httpx.ConnectError, httpcore.ConnectError) as e:
+    log.error(f"❌ Telegram Bot 连接失败: 无法连接 API，请检查代理配置 (代理: {proxy_url}) | 错误: {e}")
+  except TelegramError as e:
+    log.error(f"❌ Telegram API 异常: {e}")
+  except Exception as e:
+    log.error(f"❌ Telegram 服务发生未预期错误: {e}")
+  finally:
+    _bot_loop = None
     try:
-        log.info("Telegram 交互与控制服务启动中...")
-        _tg_app.run_polling(
-            drop_pending_updates=True, 
-            stop_signals=None,
-            bootstrap_retries=3  # 尝试连接3次
-        )
-    except (NetworkError, httpx.ConnectError, httpcore.ConnectError) as e:
-        log.error(f"❌ Telegram Bot 连接失败: 无法连接 API，请检查代理配置 (代理: {proxy_url}) | 错误: {e}")
-    except TelegramError as e:
-        log.error(f"❌ Telegram API 异常: {e}")
-    except Exception as e:
-        log.error(f"❌ Telegram 服务发生未预期错误: {e}")
+      if not loop.is_closed():
+        loop.close()
+    except Exception:
+      pass
 
-
-# 后台线程启动
-t = threading.Thread(target=_run_bot, daemon=True, name="TelegramBotThread")
-t.start()
 
 # ═══════════════════════════════════════════════════════════════
 # 3. 原有被动推送函数
 # ═══════════════════════════════════════════════════════════════
 
 
-def send_telegram(message: str):
-  """发送异步 Telegram 消息"""
-  if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
-    return
-
-  if _tg_app and _tg_app.bot:
-    try:
-      loop = asyncio.get_event_loop()
-      if loop.is_running():
-        asyncio.run_coroutine_threadsafe(
-            _tg_app.bot.send_message(
-                chat_id=config.TELEGRAM_CHAT_ID,
-                text=message,
-                parse_mode="HTML",
-            ),
-            loop,
-        )
-        return
-    except Exception:
-      pass
-
-  import requests
-
+def _log_send_result(future):
+  """异步发送完成回调：只记日志，绝不向外抛异常"""
   try:
-    url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
-    requests.post(
-        url,
-        data={
-            "chat_id": config.TELEGRAM_CHAT_ID,
-            "text": message,
-            "parse_mode": "HTML",
-        },
-        timeout=10,
-    )
+    future.result()
+    log.info("Telegram 消息已发送。")
   except Exception as e:
-    log.debug(f"Telegram 发送异常: {e}")
+    log.warning(f"Telegram 消息发送失败: {e}")
+
+
+def send_telegram(message: str):
+  """发送 Telegram 消息 (永不抛异常, 失败只记日志)
+
+  1) NOTIFY_METHOD == "console": 直接打印到日志
+  2) 轮询线程在线: 用 asyncio.run_coroutine_threadsafe 投递到 Bot 的事件循环 (不阻塞交易线程)
+  3) 否则: requests 同步兜底 (带代理, 检查 HTTP 状态码)
+  """
+  try:
+    notify_method = str(getattr(config, "NOTIFY_METHOD", "telegram")).lower()
+    if notify_method == "console":
+      log.info(f"[通知-console] {message}")
+      return
+
+    token = getattr(config, "TELEGRAM_BOT_TOKEN", None)
+    chat_id = getattr(config, "TELEGRAM_CHAT_ID", None)
+    if not token or not chat_id:
+      return
+
+    # 1) 首选：投递到 Bot 正在运行的事件循环 (交易主线程本身没有事件循环)
+    loop = _bot_loop
+    if _tg_app is not None and getattr(_tg_app, "bot", None) and loop is not None:
+      try:
+        if loop.is_running() and not loop.is_closed():
+          future = asyncio.run_coroutine_threadsafe(
+              _tg_app.bot.send_message(
+                  chat_id=chat_id,
+                  text=message,
+                  parse_mode="HTML",
+              ),
+              loop,
+          )
+          future.add_done_callback(_log_send_result)
+          return
+      except Exception as e:
+        log.warning(f"Telegram 异步投递失败，改用 HTTP 兜底: {e}")
+
+    # 2) 兜底：同步 HTTP。bot 需要代理才能连上 Telegram API，漏掉代理必然失败。
+    import requests
+
+    proxy_url = getattr(config, "TELEGRAM_PROXY", "http://127.0.0.1:7899")
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+
+    try:
+      url = f"https://api.telegram.org/bot{token}/sendMessage"
+      resp = requests.post(
+          url,
+          data={
+              "chat_id": chat_id,
+              "text": message,
+              "parse_mode": "HTML",
+          },
+          timeout=10,
+          proxies=proxies,
+      )
+      if resp.status_code != 200:
+        log.warning(f"Telegram 发送失败 (HTTP {resp.status_code}): {resp.text[:200]}")
+      else:
+        log.info("Telegram 消息已通过 HTTP 兜底发送。")
+    except Exception as e:
+      log.warning(f"Telegram 发送异常: {e}")
+  except Exception as e:
+    log.warning(f"send_telegram 未预期异常 (已忽略): {e}", exc_info=True)
 
 
 def notify_open(
@@ -361,55 +424,78 @@ def notify_open(
     sl: float,
     reason: str,
 ):
-  emoji = "📈" if direction == "BUY" else "📉"
-  send_telegram(
-      f"{emoji} <b>开仓 {direction}</b>\n"
-      f"策略: {strategy}\n"
-      f"手数: {lots}  价格: ${price:.2f}\n"
-      f"止损: ${sl:.2f}\n"
-      f"原因: {reason}"
-  )
+  """开仓通知 (sl 为美元"止损距离"，不是绝对价格；任何异常都不向外抛)"""
+  try:
+    emoji = "📈" if str(direction or "").upper() == "BUY" else "📉"
+    send_telegram(
+        f"{emoji} <b>开仓 {direction}</b>\n"
+        f"策略: {strategy}\n"
+        f"手数: {_safe_float(lots)}  价格: ${_safe_float(price):.2f}\n"
+        f"止损距离: ${_safe_float(sl):.2f}\n"
+        f"原因: {reason}"
+    )
+  except Exception as e:
+    log.warning(f"发送开仓通知失败 (交易逻辑不受影响): {e}", exc_info=True)
 
 
 def notify_close(ticket: int, strategy: str, profit: float, reason: str):
-  emoji = "✅" if profit >= 0 else "❌"
-  send_telegram(
-      f"{emoji} <b>平仓 #{ticket}</b>\n"
-      f"策略: {strategy}\n"
-      f"盈亏: ${profit:+.2f}\n"
-      f"原因: {reason}"
-  )
+  try:
+    pnl = _safe_float(profit)
+    emoji = "✅" if pnl >= 0 else "❌"
+    send_telegram(
+        f"{emoji} <b>平仓 #{ticket}</b>\n"
+        f"策略: {strategy}\n"
+        f"盈亏: ${pnl:+.2f}\n"
+        f"原因: {reason}"
+    )
+  except Exception as e:
+    log.warning(f"发送平仓通知失败 (交易逻辑不受影响): {e}", exc_info=True)
 
 
 def notify_stop_review(daily_pnl: float):
-  send_telegram(
-      f"🚨🚨🚨 <b>系统已停止</b> 🚨🚨🚨\n\n"
-      f"日内亏损: ${daily_pnl:.2f}\n"
-      f"已达日限亏 {config.DAILY_MAX_LOSSES} 笔\n\n"
-      "⚠️ 明日自动恢复"
-  )
+  try:
+    send_telegram(
+        f"🚨🚨🚨 <b>系统已停止</b> 🚨🚨🚨\n\n"
+        f"日内亏损: ${_safe_float(daily_pnl):.2f}\n"
+        f"已达日限亏 {getattr(config, 'DAILY_MAX_LOSSES', 3)} 笔\n\n"
+        "⚠️ 明日自动恢复"
+    )
+  except Exception as e:
+    log.warning(f"发送停止复核通知失败 (交易逻辑不受影响): {e}", exc_info=True)
 
 
 def notify_daily_report(total_pnl: float, daily_pnl: float, trade_count: int):
-  emoji = "🟢" if daily_pnl >= 0 else "🔴"
-  send_telegram(
-      f"📊 <b>每日绩效报告</b>\n\n"
-      f"{emoji} 当日盈亏: ${daily_pnl:+.2f}\n"
-      f"💰 累计盈亏: ${total_pnl:+.2f}\n"
-      f"📊 总交易笔数: {trade_count}\n"
-      f"🛡️ 止损余量: ${config.MAX_TOTAL_LOSS + total_pnl:.2f}"
-  )
+  try:
+    total = _safe_float(total_pnl)
+    daily = _safe_float(daily_pnl)
+    emoji = "🟢" if daily >= 0 else "🔴"
+    send_telegram(
+        f"📊 <b>每日绩效报告</b>\n\n"
+        f"{emoji} 当日盈亏: ${daily:+.2f}\n"
+        f"💰 累计盈亏: ${total:+.2f}\n"
+        f"📊 总交易笔数: {trade_count}\n"
+        f"🛡️ 止损余量: ${_safe_float(getattr(config, 'MAX_TOTAL_LOSS', 0.0)) + total:.2f}"
+    )
+  except Exception as e:
+    log.warning(f"发送每日报告失败 (交易逻辑不受影响): {e}", exc_info=True)
 
 
 def notify_system_start():
-  send_telegram(
-      f"🥇 <b>黄金量化系统启动</b>\n\n"
-      f"品种: {config.SYMBOL}\n"
-      f"风险/笔: ${config.RISK_PER_TRADE}\n"
-      f"日限亏: {config.DAILY_MAX_LOSSES}笔\n"
-      f"总限亏: ${config.MAX_TOTAL_LOSS}"
-  )
+  try:
+    send_telegram(
+        f"🥇 <b>黄金量化系统启动</b>\n\n"
+        f"品种: {getattr(config, 'SYMBOL', 'XAUUSD')}\n"
+        f"风险/笔: ${_safe_float(getattr(config, 'RISK_PER_TRADE', 0.0))}\n"
+        f"日限亏: {getattr(config, 'DAILY_MAX_LOSSES', 3)}笔\n"
+        f"总限亏: ${_safe_float(getattr(config, 'MAX_TOTAL_LOSS', 0.0))}"
+    )
+  except Exception as e:
+    log.warning(f"发送启动通知失败 (交易逻辑不受影响): {e}", exc_info=True)
 
 
 def notify_error(error_msg: str):
-  send_telegram(f"⚠️ <b>系统异常</b>\n\n{error_msg}")
+  """异常通知 (当前无调用方，保留定义；保证自身永不抛异常)"""
+  try:
+    send_telegram(f"⚠️ <b>系统异常</b>\n\n{error_msg}")
+  except Exception as e:
+    log.warning(f"发送异常通知失败 (已忽略): {e}", exc_info=True)
